@@ -1,0 +1,18 @@
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+# FastAPI's Query(...) defaults are the idiomatic dependency-injection pattern.
+extend-ignore = ["B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+filterwarnings = [
+    # Emitted inside duckdb's .df() on pandas 3.1, not by our code.
+    "ignore:The inplace keyword in DataFrame.drop is deprecated:DeprecationWarning",
+    "ignore:The inplace keyword in DataFrame.drop is deprecated",
+]

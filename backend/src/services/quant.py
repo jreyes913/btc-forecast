@@ -1,161 +1,233 @@
+"""Two-stage factor model for 1-minute BTC returns.
+
+Stage 1: PC1 of the standardized factor-basket returns is the market factor, and BTC
+returns are regressed on it: ``r_btc = alpha + beta * f + eps``.
+Stage 2: the factor gets a GARCH(1,1)-t, and the idiosyncratic residual an
+AR(1)-GJR-GARCH(1,1) with skew-t innovations.
+
+Forecast bands come from Monte Carlo paths of *both* components, so they include factor
+risk (beta^2 * Var(f)) as well as idiosyncratic risk. OLS residuals are orthogonal to the
+regressor, so the two components are simulated independently.
+
+All internal returns are in basis points (log return * 1e4), which keeps 1-minute
+variances in a range where GARCH MLE converges cleanly.
+"""
+
+from __future__ import annotations
+
 import dataclasses as dc
-from typing import Any
+from collections.abc import Callable
 
 import numpy as np
 import pandas as pd
-import statsmodels.api as sm
 from arch import arch_model
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
+from arch.univariate.base import ARCHModelResult
+
+from src.settings import MAX_FFILL_MINUTES, N_SIMULATIONS
+
+BPS = 1e4
+QUANTILES = {"p025": 0.025, "p16": 0.16, "p50": 0.50, "p84": 0.84, "p975": 0.975}
+MIN_OBS = 500
+
+
+class InsufficientDataError(ValueError):
+    pass
+
+
+def build_return_panel(closes: pd.DataFrame, max_ffill: int = MAX_FFILL_MINUTES) -> pd.DataFrame:
+    """Aligned 1-minute log returns (bps) on a complete UTC minute grid.
+
+    Coinbase omits minutes with no trades. A missing minute means "no trade", so the last
+    price is carried forward (a zero return) for up to ``max_ffill`` minutes. Longer holes
+    are dropped instead of being treated as a single 1-minute return.
+    """
+    if closes.empty:
+        return closes.copy()
+    grid = pd.date_range(closes.index.min(), closes.index.max(), freq="1min")
+    prices = closes.sort_index().reindex(grid).ffill(limit=max_ffill)
+    returns = np.log(prices).diff() * BPS
+    return returns.replace([np.inf, -np.inf], np.nan).dropna()
+
+
+@dc.dataclass(frozen=True)
+class FactorFit:
+    pc1: pd.Series
+    loadings: dict[str, float]
+    explained_variance_ratio: float
+
+
+def fit_factor(factor_returns: pd.DataFrame) -> FactorFit:
+    """First principal component of the standardized factor returns.
+
+    The sign is fixed so the first column's loading is positive, so PC1 means "the
+    market went up" for every fit.
+    """
+    z = (factor_returns - factor_returns.mean()) / factor_returns.std(ddof=0)
+    eigvals, eigvecs = np.linalg.eigh(np.cov(z.values, rowvar=False))
+    w = eigvecs[:, -1]  # eigh sorts ascending, so the last column is PC1
+    if w[0] < 0:
+        w = -w
+    pc1 = pd.Series(z.values @ w, index=factor_returns.index, name="pc1")
+    return FactorFit(
+        pc1=pc1,
+        loadings={col: float(v) for col, v in zip(factor_returns.columns, w, strict=True)},
+        explained_variance_ratio=float(eigvals[-1] / eigvals.sum()),
+    )
+
+
+@dc.dataclass(frozen=True)
+class CapmFit:
+    alpha: float  # bps per minute
+    beta: float  # bps of BTC per unit of PC1
+    r2: float
+    resid: pd.Series
+
+
+def fit_capm(y: pd.Series, f: pd.Series) -> CapmFit:
+    X = np.column_stack([np.ones(len(f)), f.values])
+    coef, *_ = np.linalg.lstsq(X, y.values, rcond=None)
+    resid = y.values - X @ coef
+    r2 = 1.0 - resid.var() / y.values.var()
+    return CapmFit(
+        alpha=float(coef[0]),
+        beta=float(coef[1]),
+        r2=float(r2),
+        resid=pd.Series(resid, index=y.index, name="resid"),
+    )
+
+
+def fit_resid_garch(resid: pd.Series) -> ARCHModelResult:
+    model = arch_model(
+        resid, mean="AR", lags=1, vol="GARCH", p=1, o=1, q=1, dist="skewt", rescale=False
+    )
+    return model.fit(disp="off", options={"maxiter": 500})
+
+
+def fit_factor_garch(pc1: pd.Series) -> ARCHModelResult:
+    model = arch_model(pc1, mean="Zero", vol="GARCH", p=1, q=1, dist="t", rescale=False)
+    return model.fit(disp="off", options={"maxiter": 500})
+
+
+def _inverse_cdf_rng(fit: ARCHModelResult, gen: np.random.Generator) -> Callable:
+    """Seeded standardized innovations for ``fit``'s distribution (arch's own simulator
+    ignores ``random_state`` for skew-t, so we draw via the inverse CDF instead)."""
+    dist = fit.model.distribution
+    dist_params = fit.params[dist.parameter_names()].values if dist.parameter_names() else None
+    return lambda size: dist.ppf(gen.uniform(size=size), dist_params)
+
+
+def simulate_returns(
+    fit: ARCHModelResult, horizon: int, n_sims: int, gen: np.random.Generator
+) -> np.ndarray:
+    """Simulated future returns, shape (n_sims, horizon)."""
+    fc = fit.forecast(
+        horizon=horizon,
+        method="simulation",
+        simulations=n_sims,
+        reindex=False,
+        rng=_inverse_cdf_rng(fit, gen),
+    )
+    return fc.simulations.values[-1]
 
 
 @dc.dataclass
-class QuantModelResult:
-    alpha: float
+class ForecastResult:
+    last_time: pd.Timestamp
+    last_close: float
+    horizon: int
+    n_obs: int
+    # Stage 1
+    alpha_bps: float
     beta: float
+    capm_r2: float
     pca_explained_variance_ratio: float
     pca_loadings: dict[str, float]
-    residual_std_error: float
-    garch_params: dict[str, float]
-    forecast_mean_returns: list[float]
-    forecast_volatility: list[float]
-    residuals_series: pd.Series
-    historical_volatility: list[dict[str, Any]]
+    resid_std_bps: float
+    # Stage 2
+    resid_garch_params: dict[str, float]
+    factor_garch_params: dict[str, float]
+    resid_converged: bool
+    factor_converged: bool
+    # Share of the horizon-H cumulative return variance explained by the factor
+    factor_variance_share: float
+    # Conditional volatility history (bps per minute): total and idiosyncratic
+    historical_volatility: pd.DataFrame
+    # Forecast paths: cumulative log return (bps) quantiles and price paths
+    cum_return_quantiles: dict[str, np.ndarray]
+    price_quantiles: dict[str, np.ndarray]
+    price_mean: np.ndarray
+    cum_return_var: np.ndarray  # forecast variance of cumulative return (bps^2) per step
 
 
-class BtcFactorGarchModel:
-    def __init__(self, scale_factor: float = 1000.0):
-        # 1000.0 brings 1-minute return variance into [0.1, 10.0] for clean GARCH MLE convergence
-        self.scale_factor = scale_factor
-        self.scaler = StandardScaler()
-        self.pca = PCA(n_components=1)
-        self.capm_fit = None
-        self.garch_fit = None
+def fit_and_forecast(
+    closes: pd.DataFrame,
+    target: str,
+    factors: list[str],
+    horizon: int,
+    n_sims: int = N_SIMULATIONS,
+    seed: int | None = None,
+) -> ForecastResult:
+    """Fit both stages on ``closes`` (wide close prices) and forecast ``horizon`` minutes.
 
-    def _prepare_aligned_returns(
-        self,
-        btc_df: pd.DataFrame,
-        eth_df: pd.DataFrame,
-        sp500_df: pd.DataFrame,
-        time_col: str = "time",
-        price_col: str = "close",
-    ) -> pd.DataFrame:
-        btc = btc_df[[time_col, price_col]].rename(columns={price_col: "btc"}).set_index(time_col)
-        eth = eth_df[[time_col, price_col]].rename(columns={price_col: "eth"}).set_index(time_col)
-        sp = sp500_df[[time_col, price_col]].rename(columns={price_col: "sp500"}).set_index(time_col)
+    ``seed`` defaults to the last bar's timestamp, so a given data snapshot always produces
+    the same bands.
+    """
+    returns = build_return_panel(closes[[target, *factors]])
+    if len(returns) < MIN_OBS:
+        raise InsufficientDataError(f"need {MIN_OBS} aligned returns, have {len(returns)}")
 
-        merged = btc.join([eth, sp], how="left").sort_index()
-        merged["sp500"] = merged["sp500"].ffill()
-        merged = merged.dropna()
+    factor = fit_factor(returns[factors])
+    capm = fit_capm(returns[target], factor.pc1)
+    resid_fit = fit_resid_garch(capm.resid)
+    factor_fit = fit_factor_garch(factor.pc1)
 
-        returns = np.log(merged / merged.shift(1)).dropna() * self.scale_factor
-        # Replace any infinities from zero prices if they ever occur
-        returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
-        return returns
+    last_close_series = closes[target].dropna()
+    last_time = last_close_series.index[-1]
+    last_close = float(last_close_series.iloc[-1])
+    if seed is None:
+        seed = int(pd.Timestamp(last_time).timestamp())
+    gen = np.random.default_rng(seed)
 
-    def fit_and_forecast(
-        self,
-        btc_df: pd.DataFrame,
-        eth_df: pd.DataFrame,
-        sp500_df: pd.DataFrame,
-        horizon: int = 30,
-    ) -> QuantModelResult:
-        returns = self._prepare_aligned_returns(btc_df, eth_df, sp500_df)
+    f_sims = simulate_returns(factor_fit, horizon, n_sims, gen)
+    e_sims = simulate_returns(resid_fit, horizon, n_sims, gen)
+    cum = np.cumsum(capm.alpha + capm.beta * f_sims + e_sims, axis=1)  # bps
+    cum_factor = np.cumsum(capm.beta * f_sims, axis=1)
 
-        # --- Stage 1: PCA Market Factor & CAPM Regression ---
-        factor_inputs = returns[["eth", "sp500"]].values
-        factor_scaled = self.scaler.fit_transform(factor_inputs)
-        pc1 = self.pca.fit_transform(factor_scaled).ravel()
+    cum_q = {k: np.quantile(cum, q, axis=0) for k, q in QUANTILES.items()}
+    price_q = {k: last_close * np.exp(v / BPS) for k, v in cum_q.items()}
+    cum_var = cum.var(axis=0)
 
-        if np.sum(self.pca.components_) < 0:
-            pc1 = -pc1
-            loadings = -self.pca.components_[0]
-        else:
-            loadings = self.pca.components_[0]
-
-        X = sm.add_constant(pc1)
-        y = returns["btc"].values
-        self.capm_fit = sm.OLS(y, X).fit()
-
-        # Convert alpha back to percentage points (%) for display consistency
-        alpha_pct = float(self.capm_fit.params[0]) * (100.0 / self.scale_factor)
-        beta = float(self.capm_fit.params[1])
-
-        residuals = pd.Series(self.capm_fit.resid, index=returns.index, name="capm_resid")
-        residual_std_error = float(np.sqrt(self.capm_fit.mse_resid)) / self.scale_factor
-
-        # --- Stage 2: AR(1) + GJR-GARCH(1,1) with Skew-t Innovations ---
-        garch_spec = arch_model(
-            residuals,
-            mean="AR",
-            lags=1,
-            vol="GARCH",
-            p=1,
-            o=1,
-            q=1,
-            dist="skewt",
-            rescale=False,
-        )
-        self.garch_fit = garch_spec.fit(disp="off", options={"maxiter": 500})
-
-        # Use 'bootstrap' for multi-step non-linear GJR-GARCH to prevent extreme skew-t simulation blowups
-        forecasts = self.garch_fit.forecast(
-            horizon=horizon,
-            method="bootstrap" if horizon > 1 else "analytic",
-            simulations=500,
-            reindex=False,
-        )
-
-        # Unscale back to raw log returns and guard against NaN/Inf
-        raw_mean = np.nan_to_num(forecasts.mean.iloc[-1].values / self.scale_factor, nan=0.0, posinf=0.0, neginf=0.0)
-        raw_var = np.nan_to_num(forecasts.variance.iloc[-1].values, nan=0.0, posinf=1.0, neginf=0.0)
-        raw_vol = np.sqrt(np.maximum(raw_var, 0.0)) / self.scale_factor
-
-        # Extract historical conditional volatility (sigma_t)
-        cond_vol = (self.garch_fit.conditional_volatility / self.scale_factor).dropna()
-        hist_vol_records = [
-            {"time": ts.isoformat(), "volatility": float(val)}
-            for ts, val in cond_vol.items()
-            if np.isfinite(val)
-        ]
-
-        return QuantModelResult(
-            alpha=alpha_pct,
-            beta=beta,
-            pca_explained_variance_ratio=float(self.pca.explained_variance_ratio_[0]),
-            pca_loadings={"eth": float(loadings[0]), "sp500": float(loadings[1])},
-            residual_std_error=residual_std_error,
-            garch_params={k: float(v) for k, v in self.garch_fit.params.items() if np.isfinite(v)},
-            forecast_mean_returns=raw_mean.tolist(),
-            forecast_volatility=raw_vol.tolist(),
-            residuals_series=residuals / self.scale_factor,
-            historical_volatility=hist_vol_records,
-        )
-
-    def project_price_path(
-        self,
-        last_close: float,
-        result: QuantModelResult,
-        expected_pc1_return: float = 0.0,
-    ) -> dict[str, list[float]]:
-        unscaled_alpha = result.alpha / 100.0
-        unscaled_beta = result.beta
-
-        total_log_returns = [
-            unscaled_alpha + (unscaled_beta * expected_pc1_return) + ar_resid
-            for ar_resid in result.forecast_mean_returns
-        ]
-
-        # Clamp cumulative log returns to [-0.5, 0.5] (~ +/- 65% move) to guarantee finite exp()
-        cum_returns = np.clip(np.cumsum(total_log_returns), -0.5, 0.5)
-        cum_vol = np.clip(np.sqrt(np.cumsum(np.square(result.forecast_volatility))), 0.0, 0.5)
-
-        expected_prices = (last_close * np.exp(cum_returns)).tolist()
-        upper_band = (last_close * np.exp(cum_returns + cum_vol)).tolist()
-        lower_band = (last_close * np.exp(cum_returns - cum_vol)).tolist()
-
-        return {
-            "expected_price": expected_prices,
-            "upper_1sd": upper_band,
-            "lower_1sd": lower_band,
+    sigma_f = factor_fit.conditional_volatility
+    sigma_e = resid_fit.conditional_volatility
+    hist = pd.DataFrame(
+        {
+            "total": np.sqrt(capm.beta**2 * sigma_f**2 + sigma_e**2),
+            "idiosyncratic": sigma_e,
         }
+    ).dropna()
+
+    def finite_params(fit: ARCHModelResult) -> dict[str, float]:
+        return {k: float(v) for k, v in fit.params.items() if np.isfinite(v)}
+
+    return ForecastResult(
+        last_time=pd.Timestamp(last_time),
+        last_close=last_close,
+        horizon=horizon,
+        n_obs=len(returns),
+        alpha_bps=capm.alpha,
+        beta=capm.beta,
+        capm_r2=capm.r2,
+        pca_explained_variance_ratio=factor.explained_variance_ratio,
+        pca_loadings=factor.loadings,
+        resid_std_bps=float(capm.resid.std()),
+        resid_garch_params=finite_params(resid_fit),
+        factor_garch_params=finite_params(factor_fit),
+        resid_converged=resid_fit.convergence_flag == 0,
+        factor_converged=factor_fit.convergence_flag == 0,
+        factor_variance_share=float(cum_factor[:, -1].var() / cum[:, -1].var()),
+        historical_volatility=hist,
+        cum_return_quantiles=cum_q,
+        price_quantiles=price_q,
+        price_mean=last_close * np.exp(cum / BPS).mean(axis=0),
+        cum_return_var=cum_var,
+    )
