@@ -1,45 +1,58 @@
-import { useEffect, useState } from "react";
+import { useCallback, useRef, useState } from "react";
+import { getJson, type BacktestResponse, type Candle, type ForecastResponse } from "./api";
 import { BtcChart } from "./components/BtcChart";
-import { VolatilityChart, VolatilityPoint } from "./components/VolatilityChart";
-import { ForecastPanel, ForecastPoint, QuantMetrics } from "./components/ForecastPanel";
+import { MetricsPanel } from "./components/MetricsPanel";
+import { VolatilityChart } from "./components/VolatilityChart";
+import { usePolling } from "./hooks/usePolling";
+import { colors } from "./theme";
+
+const WINDOW_MS = 72 * 60 * 60 * 1000;
+// Re-request a few recent bars each poll so the backend's late bar revisions reach the chart.
+const OVERLAP_MS = 3 * 60 * 1000;
+
+function mergeCandles(prev: Candle[], incoming: Candle[]): Candle[] {
+  if (incoming.length === 0) return prev;
+  const byTime = new Map(prev.map((c) => [c.time, c]));
+  for (const c of incoming) byTime.set(c.time, c);
+  const merged = [...byTime.values()].sort((a, b) => Date.parse(a.time) - Date.parse(b.time));
+  const cutoff = Date.parse(merged[merged.length - 1].time) - WINDOW_MS;
+  return merged.filter((c) => Date.parse(c.time) >= cutoff);
+}
 
 function App() {
-  const [histVol, setHistVol] = useState<VolatilityPoint[]>([]);
-  const [forecast, setForecast] = useState<ForecastPoint[]>([]);
-  const [metrics, setMetrics] = useState<QuantMetrics | null>(null);
-  const [forecastStatus, setForecastStatus] = useState<string>("");
+  const [candles, setCandles] = useState<Candle[]>([]);
+  const [forecast, setForecast] = useState<ForecastResponse | null>(null);
+  const [backtest, setBacktest] = useState<BacktestResponse | null>(null);
+  const lastCandleRef = useRef<string | null>(null);
 
-  useEffect(() => {
-    const fetchForecast = async () => {
-      try {
-        const res = await fetch("/forecast?horizon=60");
-        if (res.status === 503) {
-          setForecastStatus("Waiting for BTC, ETH, and SPX data to finish loading...");
-          setTimeout(fetchForecast, 5000);
-          return;
-        }
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const candleStatus = usePolling(
+    useCallback(async (signal: AbortSignal) => {
+      const last = lastCandleRef.current;
+      const since = last ? `?since=${encodeURIComponent(new Date(Date.parse(last) - OVERLAP_MS).toISOString())}` : "";
+      const rows = await getJson<Candle[]>(`/candles${since}`, signal);
+      if (rows.length) lastCandleRef.current = rows[rows.length - 1].time;
+      setCandles((prev) => mergeCandles(prev, rows));
+    }, []),
+  );
 
-        const data = await res.json();
-        setHistVol(data.historical_volatility ?? []);
-        setForecast(data.forecast ?? []);
-        setMetrics(data.metrics ?? null);
-        setForecastStatus("");
-      } catch (err) {
-        console.error("Forecast fetch failed:", err);
-        setForecastStatus("Unable to fetch forecast metrics.");
-      }
-    };
+  const forecastStatus = usePolling(
+    useCallback(async (signal: AbortSignal) => {
+      setForecast(await getJson<ForecastResponse>("/forecast", signal));
+    }, []),
+  );
 
-    fetchForecast();
-    const interval = setInterval(fetchForecast, 60_000);
-    return () => clearInterval(interval);
-  }, []);
+  const backtestStatus = usePolling(
+    useCallback(async (signal: AbortSignal) => {
+      setBacktest(await getJson<BacktestResponse>("/backtest", signal));
+    }, []),
+    5 * 60_000,
+    60_000,
+  );
 
   return (
     <main
       style={{
-        backgroundColor: "#020617",
+        backgroundColor: colors.page,
         minHeight: "100vh",
         padding: "1rem",
         boxSizing: "border-box",
@@ -47,26 +60,29 @@ function App() {
       }}
     >
       {forecastStatus && (
-        <div style={{ color: "#facc15", marginBottom: "0.75rem", fontSize: "0.9rem" }}>
-          {forecastStatus}
+        <div style={{ color: colors.warn, marginBottom: "0.75rem", fontSize: "0.9rem" }}>
+          Forecast: {forecastStatus}
         </div>
       )}
 
-      {/* Top Row: Candlestick (Left) & Historical Volatility (Right) */}
       <div
         style={{
           display: "grid",
-          gridTemplateColumns: "repeat(auto-fit, minmax(520px, 1fr))",
+          gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 520px), 1fr))",
           gap: "1rem",
           marginBottom: "1rem",
         }}
       >
-        <BtcChart />
-        <VolatilityChart data={histVol} />
+        <BtcChart candles={candles} forecast={forecast?.forecast ?? []} status={candleStatus} />
+        <VolatilityChart data={forecast?.historical_volatility ?? []} />
       </div>
 
-      {/* Bottom Row: Forecast & CAPM / GJR-GARCH Metrics */}
-      <ForecastPanel forecast={forecast} metrics={metrics} />
+      <MetricsPanel
+        metrics={forecast?.metrics ?? null}
+        diagnostics={forecast?.diagnostics ?? null}
+        backtest={backtest}
+        backtestStatus={backtestStatus}
+      />
     </main>
   );
 }
