@@ -1,0 +1,29 @@
+# Python virtual environments & bytecode
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Local DuckDB & SQLite database files (auto-generated at runtime)
+backend/data/
+*.duckdb
+*.duckdb.wal
+*.db
+*.db-wal
+*.db-shm
+
+# Node & React / Vite build outputs
+node_modules/
+frontend/dist/
+.vite/
+
+# Environment variables & secrets
+.env
+.env.*
+
+# Editor & OS metadata
+.vscode/
+.idea/
+.DS_Store
