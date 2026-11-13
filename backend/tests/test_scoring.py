@@ -9,6 +9,7 @@ from src.services.quant import Q_GRID
 from src.services.scoring import (
     ForecastLog,
     ForecastRecord,
+    add_ensemble,
     diebold_mariano,
     quantile_cdf,
     strike_probabilities,
@@ -112,3 +113,39 @@ def test_insert_is_idempotent(store_with_prices):
     flog.insert([record(15)])  # must not wipe the realized value
     assert len(flog.read_resolved()) == 1
     assert flog.origins("live") == {T0}
+
+
+def test_ensemble_averages_quantiles_and_sds():
+    members = pd.concat(
+        [gaussian_frame(n=50, sd_model=sd, model=m)
+         for m, sd in (("factor", 10.0), ("gjr", 20.0), ("ewma", 30.0))]
+    )
+    out = add_ensemble(members)
+    ens = out.loc[out["model"] == "ensemble"]
+    assert len(ens) == 50
+    np.testing.assert_allclose(ens["var_bps2"], 20.0**2)  # (mean of 10, 20, 30)^2
+    np.testing.assert_allclose(np.vstack(ens["q"].to_numpy())[0], norm.ppf(Q_GRID) * 20.0)
+    # Outcomes and prices carry over from the members at the same origin
+    first = members.loc[members["model"] == "factor"].iloc[0]
+    assert ens.iloc[0]["realized_bps"] == first["realized_bps"]
+
+
+def test_ensemble_skips_origins_missing_a_member():
+    factor = gaussian_frame(n=20, model="factor")
+    gjr = gaussian_frame(n=20, model="gjr")
+    ewma = gaussian_frame(n=20, model="ewma").iloc[:15]  # 5 origins lack EWMA
+    out = add_ensemble(pd.concat([factor, gjr, ewma]))
+    assert (out["model"] == "ensemble").sum() == 15
+    assert add_ensemble(factor).equals(factor)  # nothing to combine
+
+
+def test_ensemble_of_wide_and_narrow_members_is_better_calibrated():
+    # Same outcomes for every member: only the forecast widths differ.
+    frames = [gaussian_frame(n=4000, sd_true=20.0, sd_model=sd, model=m, seed=7)
+              for m, sd in (("factor", 12.0), ("gjr", 20.0), ("ewma", 28.0))]
+    rows = {r["model"]: r for r in summarize(pd.concat(frames))["rows"]}
+    ens, narrow, wide = rows["ensemble"], rows["factor"], rows["ewma"]
+    assert abs(ens["cov68"] - 0.68) < abs(narrow["cov68"] - 0.68)
+    assert abs(ens["cov68"] - 0.68) < abs(wide["cov68"] - 0.68)
+    assert ens["brier"] < narrow["brier"] and ens["brier"] < wide["brier"]
+    assert ens["dm_p_value"] is not None and ens["dm_mean_diff"] < 0  # beats the factor model

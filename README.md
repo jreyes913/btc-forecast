@@ -60,6 +60,10 @@ the sample **grows over time**.
   - `factor@24h` / `factor@7d`: the same model fitted on other window lengths, replay only.
   - `gjr`: AR(1)-GJR-GARCH skew-t on BTC alone, via `arch`.
   - `ewma`: RiskMetrics EWMA.
+  - `ensemble`: an equal-weight average of `factor`, `gjr` and `ewma`. It averages their
+    quantiles at each probability level, which keeps the bands sharp. It's built from the
+    logged member forecasts at scoring time, so it gets scored on all history, including
+    forecasts logged before it existed.
 - **Metrics:**
   - Band coverage.
   - QLIKE (lower is better).
@@ -69,6 +73,10 @@ the sample **grows over time**.
     horizons.
 - **Fit window:** the dashboard names the fit window with the lowest 30-minute QLIKE.
   Change `FIT_WINDOW` in `settings.py` to adopt it.
+- **Cone model:** the dashboard cone comes from the factor model by default. If the ensemble
+  scores better (lower QLIKE and Brier, DM p < 0.05), set `CONE_MODEL = "ensemble"` in
+  `settings.py`. Scoring always logs the members separately, so the comparison stays fair
+  whichever model draws the cone.
 
 ---
 

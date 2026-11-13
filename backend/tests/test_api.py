@@ -1,4 +1,5 @@
 import duckdb as dd
+import numpy as np
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
@@ -93,3 +94,28 @@ def test_backtest_summary_by_source(client):
     assert client.get("/backtest", params={"source": "replay"}).json()["rows"] == []
     assert client.get("/backtest", params={"source": "bogus"}).status_code == 422
     assert np.isfinite(rows["factor"]["qlike"])
+
+
+def test_ensemble_cone_switch(client):
+    from src.services.forecast_cache import ForecastCache
+    from src.settings import FACTOR_PRODUCTS, TARGET
+
+    app = client.app
+    app.state.cache = ForecastCache(app.state.store, TARGET, FACTOR_PRODUCTS, cone_model="ensemble")
+    body = client.get("/forecast", params={"horizon": 30}).json()
+    assert body["diagnostics"]["cone_model"] == "ensemble"
+    for p in body["forecast"][1:]:
+        assert p["p025"] < p["p16"] < p["p50"] < p["p84"] < p["p975"]
+
+    # The factor result used for scoring stays the pure factor model
+    factor = app.state.cache.get_factor(30)
+    cone = app.state.cache.get(30)
+    assert factor.cone_model == "factor" and cone.cone_model == "ensemble"
+    assert not np.allclose(factor.cum_return_var, cone.cum_return_var)
+
+
+def test_invalid_cone_model_rejected(client):
+    from src.services.forecast_cache import ForecastCache
+
+    with pytest.raises(ValueError):
+        ForecastCache(client.app.state.store, "BTC-USD", [], cone_model="bogus")

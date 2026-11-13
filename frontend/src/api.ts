@@ -44,6 +44,7 @@ export interface Diagnostics {
   factor_converged: boolean;
   seasonality_active: boolean;
   fit_window_hours: number;
+  cone_model: "factor" | "ensemble";
 }
 
 export interface ForecastResponse {

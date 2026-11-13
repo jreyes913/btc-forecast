@@ -38,6 +38,8 @@ from src.services.quant import Q_GRID
 from src.settings import MAX_FFILL_MINUTES, TARGET
 
 REFERENCE_MODEL = "factor"
+ENSEMBLE_MODEL = "ensemble"
+ENSEMBLE_MEMBERS = ("factor", "gjr", "ewma")
 STRIKE_STEP = 100.0
 MAX_STRIKES = 200
 CALIBRATION_BINS = 10
@@ -265,12 +267,50 @@ def _qlike(var: np.ndarray, r: np.ndarray) -> np.ndarray:
     return np.log(var) + r**2 / var
 
 
+def combine_quantiles(q: np.ndarray, var: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Equal-weight quantile averaging (Vincentization) over axis 1.
+
+    ``q`` has shape (n, members, len(Q_GRID)) and ``var`` (n, members). The combined
+    variance is (mean SD)^2, consistent with averaging location-scale quantiles.
+    Averaging quantiles keeps the bands sharp; averaging CDFs (a linear pool) would
+    widen them, which is the opposite of what these forecasts need.
+    """
+    return q.mean(axis=1), np.sqrt(var).mean(axis=1) ** 2
+
+
+def add_ensemble(df: pd.DataFrame) -> pd.DataFrame:
+    """Append ``ensemble`` rows built from logged member forecasts.
+
+    One row per (origin, horizon, source) where every member in ``ENSEMBLE_MEMBERS``
+    was logged. Built at summary time, so historical forecasts get scored too.
+    """
+    keys = ["origin_time", "horizon", "source"]
+    members = df.loc[df["model"].isin(ENSEMBLE_MEMBERS)] if not df.empty else df
+    if members.empty:
+        return df
+    counts = members.groupby(keys)["model"].nunique()
+    complete = counts[counts == len(ENSEMBLE_MEMBERS)].index.to_frame(index=False)
+    if complete.empty:
+        return df
+    m = members.merge(complete, on=keys).sort_values([*keys, "model"])
+    k = len(ENSEMBLE_MEMBERS)
+    q = np.vstack(m["q"].to_numpy()).reshape(-1, k, len(Q_GRID))
+    var = m["var_bps2"].to_numpy().reshape(-1, k)
+    q_ens, var_ens = combine_quantiles(q, var)
+
+    ens = m.iloc[::k][[*keys, "origin_price", "realized_bps"]].copy()
+    ens["model"] = ENSEMBLE_MODEL
+    ens["var_bps2"] = var_ens
+    ens["q"] = list(q_ens)
+    return pd.concat([df, ens.reindex(columns=df.columns)], ignore_index=True)
+
+
 def summarize(df: pd.DataFrame) -> dict:
     """Summary rows, calibration, DM tests and a fit-window recommendation."""
     if df.empty:
         return {"rows": [], "calibration": [], "recommended_fit_window": None}
 
-    df = df.sort_values("origin_time")
+    df = add_ensemble(df).sort_values("origin_time")
     # Common strike range per (origin, horizon): the reference model's p1..p99 where it
     # exists, otherwise the row's own. Every model is then scored on the same strikes.
     ref = df.loc[df["model"] == REFERENCE_MODEL]

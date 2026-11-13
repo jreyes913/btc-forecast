@@ -95,6 +95,13 @@ export function MetricsPanel({ metrics, diagnostics, backtests, backtestStatus }
             Fitted on {diagnostics.n_obs.toLocaleString()} one-minute returns (last{" "}
             {Math.round(diagnostics.fit_window_hours)}h). Bands come from filtered historical
             simulation (resampled real shocks).{" "}
+            <b style={{ color: colors.textBody }}>
+              Cone drawn by:{" "}
+              {diagnostics.cone_model === "ensemble"
+                ? "the ensemble (average of factor, GJR-only and EWMA)"
+                : "the factor model"}
+              .
+            </b>{" "}
             {diagnostics.seasonality_active
               ? "Time-of-day adjustment: on."
               : "Time-of-day adjustment: off until 7 days of history are stored."}

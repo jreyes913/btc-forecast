@@ -74,6 +74,7 @@ def forecast_to_response(res: ForecastResult) -> dict:
             "factor_converged": res.factor_converged,
             "seasonality_active": res.seasonality_active,
             "fit_window_hours": res.fit_window_hours,
+            "cone_model": res.cone_model,
         },
         "historical_volatility": [
             {
@@ -180,7 +181,9 @@ def create_app(store: CandleStore | None = None, start_worker: bool = True) -> F
 def on_new_bars(app: FastAPI) -> None:
     """Refit for the newest bar, and log a live forecast every LOG_EVERY_MINUTES."""
     try:
-        res = app.state.cache.get(FORECAST_HORIZON_DEFAULT)
+        app.state.cache.get(FORECAST_HORIZON_DEFAULT)  # warm the dashboard cone
+        # Always score the pure factor model, even when the cone is the ensemble.
+        res = app.state.cache.get_factor(FORECAST_HORIZON_DEFAULT)
     except (LookupError, InsufficientDataError) as err:
         log.info("Forecast not ready yet: %s", err)
         return
