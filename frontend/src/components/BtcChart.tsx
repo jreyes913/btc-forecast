@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import { CandlestickSeries, LineSeries, LineStyle, type IChartApi } from "lightweight-charts";
-import type { Candle, ForecastPoint } from "../api";
-import { toTimestamp } from "../charts/format";
+import type { Candle, ForecastPoint, LiveResponse } from "../api";
+import { formatCrosshairTime, toTimestamp } from "../charts/format";
 import { useChart } from "../charts/useChart";
 import { colors } from "../theme";
 import { ChartPanel } from "./ChartPanel";
@@ -44,10 +44,39 @@ function setupSeries(chart: IChartApi) {
 interface Props {
   candles: Candle[];
   forecast: ForecastPoint[];
+  live: LiveResponse | null;
   status: string;
 }
 
-export function BtcChart({ candles, forecast, status }: Props) {
+const LIVE_UP = "rgba(34, 197, 94, 0.45)";
+const LIVE_DOWN = "rgba(239, 68, 68, 0.45)";
+
+/** "Cone from $X at 16:43 · live $Y (+Z bps)": makes a stale cone origin obvious. */
+function OriginBadge({ live }: { live: LiveResponse | null }) {
+  if (!live?.cone_origin_price || !live.cone_origin_time) return null;
+  const origin = live.cone_origin_price;
+  const now = live.bar?.close ?? null;
+  const drift = now === null ? null : Math.log(now / origin) * 1e4;
+  const big = drift !== null && Math.abs(drift) >= 10;
+  return (
+    <div style={{ fontSize: "0.8rem", color: colors.textMuted, marginBottom: "0.4rem" }}>
+      Cone from <b style={{ color: colors.text }}>${origin.toLocaleString(undefined, { maximumFractionDigits: 0 })}</b>{" "}
+      at {formatCrosshairTime(toTimestamp(live.cone_origin_time))}
+      {now !== null && (
+        <>
+          {" · live "}
+          <b style={{ color: colors.text }}>${now.toLocaleString(undefined, { maximumFractionDigits: 0 })}</b>{" "}
+          <span style={{ color: big ? colors.warn : colors.textMuted }}>
+            ({drift! >= 0 ? "+" : ""}
+            {drift!.toFixed(1)} bps{big ? ": price has moved since the cone's origin; shift strikes by this much" : ""})
+          </span>
+        </>
+      )}
+    </div>
+  );
+}
+
+export function BtcChart({ candles, forecast, live, status }: Props) {
   const { containerRef, handle } = useChart(setupSeries);
   const hasFitRef = useRef(false);
 
@@ -62,11 +91,25 @@ export function BtcChart({ candles, forecast, status }: Props) {
         close: c.close,
       })),
     );
+    // The forming bar (display only, muted) goes after the last closed bar.
+    const bar = live?.bar;
+    if (bar && toTimestamp(bar.time) > toTimestamp(candles[candles.length - 1].time)) {
+      const color = bar.close >= bar.open ? LIVE_UP : LIVE_DOWN;
+      handle.series.candles.update({
+        time: toTimestamp(bar.time),
+        open: bar.open,
+        high: bar.high,
+        low: bar.low,
+        close: bar.close,
+        color,
+        wickColor: color,
+      });
+    }
     if (!hasFitRef.current) {
       handle.chart.timeScale().fitContent();
       hasFitRef.current = true;
     }
-  }, [handle, candles]);
+  }, [handle, candles, live]);
 
   useEffect(() => {
     if (!handle) return;
@@ -85,6 +128,7 @@ export function BtcChart({ candles, forecast, status }: Props) {
       title="BTC-USD · 1m candles with forecast cone"
       toolbar={<ChartToolbar chart={handle?.chart ?? null} lastTime={lastTime} rightEdge={forecastEnd} />}
       status={status}
+      header={<OriginBadge live={live} />}
       containerRef={containerRef}
       height={420}
       legend={

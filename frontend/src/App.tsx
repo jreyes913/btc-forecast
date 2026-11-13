@@ -1,5 +1,12 @@
 import { useCallback, useRef, useState } from "react";
-import { getJson, type BacktestResponse, type Candle, type ForecastResponse } from "./api";
+import {
+  getJson,
+  type BacktestResponse,
+  type BacktestSource,
+  type Candle,
+  type ForecastResponse,
+  type LiveResponse,
+} from "./api";
 import { BtcChart } from "./components/BtcChart";
 import { MetricsPanel } from "./components/MetricsPanel";
 import { VolatilityChart } from "./components/VolatilityChart";
@@ -22,7 +29,8 @@ function mergeCandles(prev: Candle[], incoming: Candle[]): Candle[] {
 function App() {
   const [candles, setCandles] = useState<Candle[]>([]);
   const [forecast, setForecast] = useState<ForecastResponse | null>(null);
-  const [backtest, setBacktest] = useState<BacktestResponse | null>(null);
+  const [backtests, setBacktests] = useState<Partial<Record<BacktestSource, BacktestResponse>>>({});
+  const [live, setLive] = useState<LiveResponse | null>(null);
   const lastCandleRef = useRef<string | null>(null);
 
   const candleStatus = usePolling(
@@ -41,12 +49,24 @@ function App() {
     }, []),
   );
 
+  usePolling(
+    useCallback(async (signal: AbortSignal) => {
+      setLive(await getJson<LiveResponse>("/live", signal));
+    }, []),
+    10_000,
+    10_000,
+  );
+
   const backtestStatus = usePolling(
     useCallback(async (signal: AbortSignal) => {
-      setBacktest(await getJson<BacktestResponse>("/backtest", signal));
+      const sources: BacktestSource[] = ["all", "live", "replay"];
+      const results = await Promise.all(
+        sources.map((s) => getJson<BacktestResponse>(`/backtest?source=${s}`, signal)),
+      );
+      setBacktests(Object.fromEntries(sources.map((s, i) => [s, results[i]])));
     }, []),
-    5 * 60_000,
-    60_000,
+    2 * 60_000,
+    30_000,
   );
 
   return (
@@ -73,14 +93,19 @@ function App() {
           marginBottom: "1rem",
         }}
       >
-        <BtcChart candles={candles} forecast={forecast?.forecast ?? []} status={candleStatus} />
+        <BtcChart
+          candles={candles}
+          forecast={forecast?.forecast ?? []}
+          live={live}
+          status={candleStatus}
+        />
         <VolatilityChart data={forecast?.historical_volatility ?? []} />
       </div>
 
       <MetricsPanel
         metrics={forecast?.metrics ?? null}
         diagnostics={forecast?.diagnostics ?? null}
-        backtest={backtest}
+        backtests={backtests}
         backtestStatus={backtestStatus}
       />
     </main>

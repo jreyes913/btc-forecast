@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { AreaSeries, LineSeries, type IChartApi } from "lightweight-charts";
+import { AreaSeries, LineSeries, LineStyle, type IChartApi } from "lightweight-charts";
 import type { VolatilityPoint } from "../api";
 import { toTimestamp } from "../charts/format";
 import { useChart } from "../charts/useChart";
@@ -17,6 +17,13 @@ function setupSeries(chart: IChartApi) {
       lineWidth: 2,
     }),
     idio: chart.addSeries(LineSeries, { color: colors.volIdio, lineWidth: 1 }),
+    typical: chart.addSeries(LineSeries, {
+      color: colors.textMuted,
+      lineWidth: 1,
+      lineStyle: LineStyle.Dashed,
+      priceLineVisible: false,
+      lastValueVisible: false,
+    }),
   };
 }
 
@@ -30,6 +37,7 @@ export function VolatilityChart({ data }: { data: VolatilityPoint[] }) {
     handle.series.idio.setData(
       data.map((d) => ({ time: toTimestamp(d.time), value: d.idiosyncratic_bps })),
     );
+    handle.series.typical.setData(data.map((d) => ({ time: toTimestamp(d.time), value: d.typical_bps })));
     if (!hasFitRef.current) {
       handle.chart.timeScale().fitContent();
       hasFitRef.current = true;
@@ -47,7 +55,9 @@ export function VolatilityChart({ data }: { data: VolatilityPoint[] }) {
       legend={
         <>
           <span style={{ color: colors.vol }}>■</span> total √(β²σ²_f + σ²_ε) ·{" "}
-          <span style={{ color: colors.volIdio }}>■</span> idiosyncratic σ_ε
+          <span style={{ color: colors.volIdio }}>■</span> idiosyncratic σ_ε ·{" "}
+          <span style={{ color: colors.textMuted }}>- -</span> typical for this time of day (orange above
+          it = unusually volatile)
         </>
       }
     />
