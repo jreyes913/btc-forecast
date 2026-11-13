@@ -35,25 +35,47 @@ def _inverse_cdf_rng(fit: ARCHModelResult, gen: np.random.Generator) -> Callable
     return lambda size: dist.ppf(gen.uniform(size=size), dist_params)
 
 
-def gjr_forecast(
-    btc_returns: pd.Series, horizons: Iterable[int], n_sims: int, gen: np.random.Generator
-) -> HorizonForecasts:
-    horizons = list(horizons)
+def gjr_paths(
+    btc_returns: pd.Series,
+    horizon: int,
+    n_sims: int,
+    gen: np.random.Generator,
+    levels: np.ndarray = Q_GRID,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Cumulative-return quantiles at ``levels`` for every step: (horizon, len(levels)),
+    plus the forecast variance per step: (horizon,)."""
     fit = arch_model(
         btc_returns, mean="AR", lags=1, vol="GARCH", p=1, o=1, q=1, dist="skewt", rescale=False
     ).fit(disp="off", options={"maxiter": 500})
     fc = fit.forecast(
-        horizon=max(horizons),
+        horizon=horizon,
         method="simulation",
         simulations=n_sims,
         reindex=False,
         rng=_inverse_cdf_rng(fit, gen),
     )
     cum = np.cumsum(fc.simulations.values[-1], axis=1)
-    return {h: (np.quantile(cum[:, h - 1], Q_GRID), float(cum[:, h - 1].var())) for h in horizons}
+    return np.quantile(cum, levels, axis=0).T, cum.var(axis=0)
+
+
+def ewma_paths(
+    btc_returns: pd.Series, horizon: int, levels: np.ndarray = Q_GRID
+) -> tuple[np.ndarray, np.ndarray]:
+    """Gaussian quantiles with sd sqrt(h * sigma^2) for every step h = 1..horizon."""
+    var1 = float((btc_returns**2).ewm(alpha=1 - EWMA_LAMBDA, adjust=False).mean().iloc[-1])
+    var = var1 * np.arange(1, horizon + 1)
+    return np.sqrt(var)[:, None] * norm.ppf(levels)[None, :], var
+
+
+def gjr_forecast(
+    btc_returns: pd.Series, horizons: Iterable[int], n_sims: int, gen: np.random.Generator
+) -> HorizonForecasts:
+    horizons = list(horizons)
+    q, var = gjr_paths(btc_returns, max(horizons), n_sims, gen)
+    return {h: (q[h - 1], float(var[h - 1])) for h in horizons}
 
 
 def ewma_forecast(btc_returns: pd.Series, horizons: Iterable[int]) -> HorizonForecasts:
-    var1 = float((btc_returns**2).ewm(alpha=1 - EWMA_LAMBDA, adjust=False).mean().iloc[-1])
-    z = norm.ppf(Q_GRID)
-    return {h: (z * np.sqrt(h * var1), h * var1) for h in horizons}
+    horizons = list(horizons)
+    q, var = ewma_paths(btc_returns, max(horizons))
+    return {h: (q[h - 1], float(var[h - 1])) for h in horizons}

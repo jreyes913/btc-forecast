@@ -30,6 +30,9 @@ MAX_FFILL_MINUTES = 5
 FORECAST_HORIZON_DEFAULT = 60
 FORECAST_HORIZON_MAX = 240
 N_SIMULATIONS = 1000
+# Which forecaster draws the dashboard cone: "factor", or "ensemble" (equal-weight
+# quantile average of factor, GJR-only and EWMA). Scoring always tracks both.
+CONE_MODEL = "factor"
 
 # Time-of-day volatility profile
 SEASON_BUCKET_MINUTES = 15

@@ -49,6 +49,7 @@ class Diagnostics(BaseModel):
     factor_converged: bool
     seasonality_active: bool
     fit_window_hours: float
+    cone_model: str
 
 
 class ForecastResponse(BaseModel):

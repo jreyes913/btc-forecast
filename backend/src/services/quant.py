@@ -144,6 +144,7 @@ class ForecastResult:
     price_mean: np.ndarray
     cum_return_var: np.ndarray  # forecast variance of the cumulative return (bps^2) per step
     cum_q_grid: np.ndarray  # (horizon, len(Q_GRID)) cumulative return quantiles, bps
+    cone_model: str = "factor"  # which forecaster produced the bands
 
 
 def _split_panel(

@@ -14,6 +14,7 @@ function modelLabel(model: string): string {
   if (model.startsWith("factor@")) return `Factor (${model.slice(7)} fit)`;
   if (model === "gjr") return "GJR-GARCH only";
   if (model === "ewma") return "EWMA";
+  if (model === "ensemble") return "Ensemble (avg of 3)";
   return model;
 }
 
@@ -152,6 +153,7 @@ export function BacktestPanel({ backtests, status }: Props) {
                   series={[
                     { label: "Factor model", color: colors.accent, data: cal("factor") },
                     { label: "GJR-GARCH only", color: colors.vol, hollow: true, data: cal("gjr") },
+                    { label: "Ensemble", color: colors.up, hollow: true, data: cal("ensemble") },
                   ]}
                 />
               </div>
