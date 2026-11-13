@@ -34,6 +34,14 @@ N_SIMULATIONS = 1000
 # quantile average of factor, GJR-only and EWMA). Scoring always tracks both.
 CONE_MODEL = "factor"
 
+# Adaptive ensembles (scored challengers). Each resolved outcome updates a discounted
+# score per member: S <- FORGETTING * S + score; weights = softmax(S). 0.99 remembers
+# roughly the last 100 resolved forecasts, so weights can shift with market regimes
+# without collapsing onto one model.
+ENSEMBLE_FORGETTING = 0.99
+# Loss-based variant: score = -ETA * (member pinball loss / mean member loss)
+ENSEMBLE_LOSS_ETA = 1.0
+
 # Time-of-day volatility profile
 SEASON_BUCKET_MINUTES = 15
 
