@@ -43,8 +43,10 @@ def test_forecast_shape(client):
 
 def test_forecast_is_cached(client, monkeypatch):
     first = client.get("/forecast", params={"horizon": 5}).json()
-    cache = client.app.state.cache
-    monkeypatch.setattr(cache, "_fit", lambda *a, **k: pytest.fail("refit on unchanged data"))
+    monkeypatch.setattr(
+        "src.services.forecast_cache.fit_and_forecast",
+        lambda *a, **k: pytest.fail("refit on unchanged data"),
+    )
     assert client.get("/forecast", params={"horizon": 5}).json() == first
 
 
@@ -53,3 +55,41 @@ def test_forecast_503_when_empty():
     with TestClient(create_app(store=store, start_worker=False)) as c:
         assert c.get("/forecast").status_code == 503
         assert c.get("/backtest").status_code == 503
+
+
+def test_live_reports_cone_origin(client):
+    body = client.get("/live").json()
+    assert body["bar"] is None and body["cone_origin_time"] is None
+    client.get("/forecast")
+    body = client.get("/live").json()
+    assert body["cone_origin_time"] == body["last_closed_time"]
+    assert body["cone_origin_price"] > 0
+
+
+def test_backtest_summary_by_source(client):
+    import numpy as np
+    from scipy.stats import norm
+
+    from app import compute_summary
+    from src.services.quant import Q_GRID
+    from src.services.scoring import ForecastRecord
+
+    app = client.app
+    origins = pd.date_range("2026-11-01 01:00", periods=40, freq="30min", tz="UTC")
+    closes = app.state.store.read_closes(["BTC-USD"])["BTC-USD"]
+    records = [
+        ForecastRecord(t, model, 15, "live", float(closes.loc[t]), 400.0, norm.ppf(Q_GRID) * 20)
+        for t in origins
+        for model in ("factor", "ewma")
+    ]
+    app.state.forecast_log.insert(records)
+    app.state.backtest = compute_summary(app)
+
+    body = client.get("/backtest", params={"source": "live"}).json()
+    rows = {r["model"]: r for r in body["rows"]}
+    assert rows["factor"]["n"] == 40 and rows["factor"]["brier"] is not None
+    assert "dm_p_value" in rows["ewma"]
+    assert body["calibration"] and "replay_progress" in body
+    assert client.get("/backtest", params={"source": "replay"}).json()["rows"] == []
+    assert client.get("/backtest", params={"source": "bogus"}).status_code == 422
+    assert np.isfinite(rows["factor"]["qlike"])

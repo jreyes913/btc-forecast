@@ -2,9 +2,10 @@
 
 A full-stack dashboard that ingests 1-minute OHLCV candles from Coinbase Exchange for
 `BTC-USD` and a basket of crypto majors (`ETH-USD`, `SOL-USD`, `XRP-USD`, `LTC-USD`). It keeps
-a rolling 72-hour window in DuckDB and fits a two-stage **PCA factor CAPM + GARCH** model. The
-result is a Monte Carlo forecast cone for the next hour, shown in a React + TradingView
-Lightweight Charts UI served by a single FastAPI process.
+30 days of history in DuckDB and fits a **PCA factor CAPM + range-informed GJR-GARCH-X** model
+with time-of-day adjustment. The result is a forecast cone for the next hour built by
+filtered historical simulation. Every forecast is scored once its deadline passes. Everything
+is shown in a React + TradingView Lightweight Charts UI served by a single FastAPI process.
 
 ---
 
@@ -12,35 +13,62 @@ Lightweight Charts UI served by a single FastAPI process.
 
 All returns are 1-minute log returns in basis points.
 
-1. **Market factor (PCA).** The four basket returns are standardized and their first principal
-   component, PC1, is the "crypto market" factor. Its sign is fixed so the ETH loading is
-   positive.
-2. **CAPM.** OLS regression of BTC on the factor:
-   \(r_{\text{BTC},t} = \alpha + \beta\,\text{PC1}_t + \varepsilon_t\).
-3. **Volatility.**
-   - The factor gets a zero-mean GARCH(1,1) with Student-t innovations.
-   - The idiosyncratic residual \(\varepsilon_t\) gets an AR(1)-GJR-GARCH(1,1) with skewed-t
-     innovations.
-4. **Forecast cone.**
-   - Simulate 1,000 seeded paths of both components. They are independent because OLS
-     residuals are orthogonal to the regressor.
-   - Sum the paths into cumulative BTC returns and read off empirical quantiles: the median,
-     the 68% band (p16–p84) and the 95% band (p2.5–p97.5).
-   - The bands therefore include factor risk \(\beta^2\sigma_f^2\) as well as idiosyncratic risk.
-   - The drift is essentially zero at this horizon, so the width of the cone is the forecast.
+1. **Data.** Prices are put on a complete 1-minute grid and carried forward for at most 5
+   minutes, so an untraded minute counts as a zero return; longer holes are dropped. Each
+   candle's high and low give a **Parkinson range variance**, (ln H/L)² / 4 ln 2, which
+   shows how much the price moved *within* the minute.
+2. **Time-of-day adjustment.** Volatility follows a daily rhythm: the US open and data
+   releases are busier, nights and weekends calmer. A per-asset profile s(t), in 15-minute
+   buckets plus a weekend multiplier, is estimated from the full stored history. Returns are
+   divided by s(t) before fitting, and forecasts are multiplied back by s(t) for the minutes
+   they cover. The adjustment switches on once 7 days of history exist.
+3. **Market factor (PCA).** PC1 of the four standardized basket returns, with its sign fixed
+   so the ETH loading is positive.
+4. **CAPM.** OLS regression of BTC on the factor: \(r_{\text{BTC},t} = \alpha + \beta\,\text{PC1}_t + \varepsilon_t\).
+5. **Volatility: GJR-GARCH-X.** Both the factor and the idiosyncratic residual get
 
-**Data hygiene.**
-- Coinbase omits minutes with no trades. Prices are put on a complete 1-minute grid and carried
-  forward for at most 5 minutes, so an untraded minute counts as a zero return. Longer holes are
-  dropped rather than treated as a single 1-minute return.
-- The bar for the current, still-forming minute is never stored.
+   σ²ₜ = ω + (α + γ·1[εₜ₋₁<0])·ε²ₜ₋₁ + β·σ²ₜ₋₁ + **δ·RVₜ₋₁**
 
-**Backtest.**
-- A rolling-origin evaluation refits the model on a trailing 48-hour window every 30 minutes.
-  It scores 1, 15 and 60-minute forecasts on band coverage and QLIKE.
-- The model is compared against an EWMA baseline and a GJR-GARCH fitted directly to BTC
-  returns.
-- Results appear in the dashboard once about 49 hours of data have accumulated.
+   where RV is the range variance. If the range adds nothing, δ is estimated near 0. The
+   residual also has an AR(1) mean. Fitting is by Gaussian quasi-maximum likelihood
+   (`backend/src/services/garch.py`, checked against `arch` in the tests).
+6. **Forecast cone: filtered historical simulation (FHS).** Instead of drawing shocks from
+   a textbook distribution, each simulated minute resamples a *real past minute's*
+   standardized shocks, for the factor and the residual **jointly**. The cone inherits
+   BTC's real shape: many tiny moves, occasional jumps, and moves shared across coins.
+7. **Zero drift.** α and the AR constant are estimated and reported but not simulated.
+   A few days of drift is noise, not a forecast.
+
+The dashed and dotted lines are the 16/84th and 2.5/97.5th percentiles of 1,000 simulated
+paths. A strike on the lower dashed line at the deadline's point on the cone means about an
+84% model probability of finishing above it.
+
+---
+
+## Forecast scoring
+
+Every forecast is logged (`forecast_log` table) and scored once its target minute closes, so
+the sample **grows over time**.
+
+- **Live:** the production model and two baselines are logged every 5 minutes, at horizons of
+  1, 15, 30 and 60 minutes.
+- **Replay:** a background thread re-runs every model at past 30-minute origins using
+  only data available then. With 30 days stored, that's about 1,100 historical forecasts per
+  model, available within the first hour or so of running.
+- **Compared:**
+  - `factor`: the production model.
+  - `factor@24h` / `factor@7d`: the same model fitted on other window lengths, replay only.
+  - `gjr`: AR(1)-GJR-GARCH skew-t on BTC alone, via `arch`.
+  - `ewma`: RiskMetrics EWMA.
+- **Metrics:**
+  - Band coverage.
+  - QLIKE (lower is better).
+  - **Brier score at Kalshi-style $100 strikes.** All models are scored on the same strikes.
+  - A **calibration chart**: forecast vs observed frequency.
+  - **Diebold-Mariano tests** against the factor model, with Newey-West errors for overlapping
+    horizons.
+- **Fit window:** the dashboard names the fit window with the lowest 30-minute QLIKE.
+  Change `FIT_WINDOW` in `settings.py` to adopt it.
 
 ---
 
@@ -48,12 +76,14 @@ All returns are 1-minute log returns in basis points.
 
 | Piece | File | Role |
 |---|---|---|
-| Ingestion | `backend/src/services/candles.py` | Each minute, fetches only the bars missing for each product, so outages and restarts backfill themselves. Upserts into DuckDB and prunes rows older than 72 h. The table stays at about 22k rows (1–2 MB). |
-| Model | `backend/src/services/quant.py` | Stateless, testable functions for each stage above. |
-| Cache | `backend/src/services/forecast_cache.py` | One fit per new closed bar per horizon. Requests never trigger extra refits. |
-| Backtest | `backend/src/services/backtest.py`, `backend/scripts/backtest.py` | Rolling out-of-sample evaluation. Refreshed hourly in the app, or run from the CLI. |
-| API | `backend/app.py` | `GET /candles?product=&since=`, `GET /forecast?horizon=`, `GET /backtest`. Also serves `frontend/dist` at `/`. |
-| UI | `frontend/src/` | Candles with the forecast cone overlaid, total vs idiosyncratic conditional volatility, and a diagnostics and backtest panel. |
+| Ingestion | `backend/src/services/candles.py` | Every 15 s, fetches only the missing closed bars, newest first, then backfills history towards 30 days a chunk at a time. Upserts into DuckDB and prunes beyond 30 days (about 20 MB). `LivePoller` keeps the forming bar in memory for the chart only. |
+| Seasonality | `backend/src/services/seasonality.py` | Time-of-day volatility profile. |
+| Volatility | `backend/src/services/garch.py` | GJR-GARCH-X estimator and joint FHS. |
+| Model | `backend/src/services/quant.py` | The pipeline above. |
+| Cache | `backend/src/services/forecast_cache.py` | One fit per new closed bar per horizon. The profile is refreshed hourly. |
+| Scoring | `backend/src/services/{scoring,evaluation,baselines}.py` | Forecast log, resolver, metrics, replay. |
+| API | `backend/app.py` | `GET /candles?product=&since=`, `GET /forecast?horizon=`, `GET /live`, `GET /backtest?source=all\|live\|replay`. Also serves `frontend/dist` at `/`. |
+| UI | `frontend/src/` | Candles with the cone and the live bar, plus a badge when price has moved since the cone's origin. Volatility vs its typical level for the time of day. Diagnostics, and the scoring table with a calibration chart. |
 
 ---
 
@@ -75,23 +105,28 @@ cd ../backend
 fastapi run app.py
 ```
 
-Open **http://localhost:8000**. On first start, the worker downloads 72 hours of history for
-five products, which takes a minute or two. The forecast appears once at least 500 aligned
-returns are available.
+Open **http://localhost:8000**.
+
+- **Within about a minute:** the forecast appears. The last 72 hours download first.
+- **Next few minutes:** the remaining 30 days backfill in the background.
+- **After that:** replay scoring starts and fills in over roughly the next hour.
+
+> **Upgrading from an earlier version:** delete `backend/data/candles.duckdb` (and `.wal`)
+> first. The tables changed.
 
 ### Frontend development
 
 Run `fastapi run app.py` in `backend/`, then run `npm run dev` in `frontend/`. Vite proxies the
 API routes to port 8000.
 
-### Tests, lint, backtest
+### Tests, lint, scoring summary
 
 ```bash
 cd backend
 pip install -r requirements-dev.txt
 pytest -q && ruff check .
-python -m scripts.backtest              # on the stored candles
-python -m scripts.backtest --synthetic  # offline demo
+python -m scripts.backtest --synthetic   # offline: simulate 10 days, replay, score
+python -m scripts.backtest               # summary from the stored DB (stop the app first)
 
 cd ../frontend && npm run typecheck
 ```
@@ -100,5 +135,9 @@ CI (`.github/workflows/ci.yml`) runs all of these on every push.
 
 ### Configuration
 
-Products, the window length, the forward-fill limit and the number of simulations are set in
-`backend/src/settings.py`.
+Set in `backend/src/settings.py`:
+- products
+- `STORE_WINDOW` and `FIT_WINDOW`
+- the forward-fill limit
+- the number of simulations
+- logging cadence and horizons

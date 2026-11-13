@@ -1,32 +1,37 @@
 """Two-stage factor model for 1-minute BTC returns.
 
-Stage 1: PC1 of the standardized factor-basket returns is the market factor, and BTC
-returns are regressed on it: ``r_btc = alpha + beta * f + eps``.
-Stage 2: the factor gets a GARCH(1,1)-t, and the idiosyncratic residual an
-AR(1)-GJR-GARCH(1,1) with skew-t innovations.
+Pipeline (returns in basis points: log return x 1e4):
 
-Forecast bands come from Monte Carlo paths of *both* components, so they include factor
-risk (beta^2 * Var(f)) as well as idiosyncratic risk. OLS residuals are orthogonal to the
-regressor, so the two components are simulated independently.
+1. Returns and Parkinson high/low range variances on a complete minute grid.
+2. Divide out each series' time-of-day volatility profile s(t).
+3. Market factor: PC1 of the standardized basket returns.
+4. CAPM: ``r_btc = alpha + beta * f + eps``.
+5. GJR-GARCH-X for the factor and for the residual, each with a range-variance term.
+6. Filtered historical simulation: both components are driven by jointly resampled
+   historical shocks (real shape, co-jumps preserved).
+7. Multiply the simulated BTC path by s(t) for the future minutes it covers.
 
-All internal returns are in basis points (log return * 1e4), which keeps 1-minute
-variances in a range where GARCH MLE converges cleanly.
+Drift is set to zero in the forecast: alpha and the AR constant are estimated and
+reported but not simulated. In-sample drift over a few days is noise, not signal.
 """
 
 from __future__ import annotations
 
 import dataclasses as dc
-from collections.abc import Callable
+import datetime as dt
 
 import numpy as np
 import pandas as pd
-from arch import arch_model
-from arch.univariate.base import ARCHModelResult
 
+from src.services.garch import GarchXFit, fit_garch_x, simulate_fhs
+from src.services.seasonality import SeasonalProfile
 from src.settings import MAX_FFILL_MINUTES, N_SIMULATIONS
 
 BPS = 1e4
+PARKINSON = 1.0 / (4.0 * np.log(2.0))
 QUANTILES = {"p025": 0.025, "p16": 0.16, "p50": 0.50, "p84": 0.84, "p975": 0.975}
+# Finer grid logged for scoring (probabilities at arbitrary strikes are interpolated on it)
+Q_GRID = np.array([0.01, 0.025, 0.05, 0.10, 0.16, 0.25, 0.50, 0.75, 0.84, 0.90, 0.95, 0.975, 0.99])
 MIN_OBS = 500
 
 
@@ -49,11 +54,21 @@ def build_return_panel(closes: pd.DataFrame, max_ffill: int = MAX_FFILL_MINUTES)
     return returns.replace([np.inf, -np.inf], np.nan).dropna()
 
 
+def build_range_panel(high: pd.DataFrame, low: pd.DataFrame, index: pd.Index) -> pd.DataFrame:
+    """Parkinson range variance per minute, (ln(H/L))^2 / (4 ln 2), in bps^2.
+
+    Minutes without a bar (no trades) have zero range.
+    """
+    rv = PARKINSON * (np.log(high / low) * BPS) ** 2
+    return rv.reindex(index).fillna(0.0).clip(lower=0.0)
+
+
 @dc.dataclass(frozen=True)
 class FactorFit:
     pc1: pd.Series
     loadings: dict[str, float]
     explained_variance_ratio: float
+    scale: pd.Series  # std of each input series used for standardization
 
 
 def fit_factor(factor_returns: pd.DataFrame) -> FactorFit:
@@ -62,7 +77,8 @@ def fit_factor(factor_returns: pd.DataFrame) -> FactorFit:
     The sign is fixed so the first column's loading is positive, so PC1 means "the
     market went up" for every fit.
     """
-    z = (factor_returns - factor_returns.mean()) / factor_returns.std(ddof=0)
+    scale = factor_returns.std(ddof=0)
+    z = (factor_returns - factor_returns.mean()) / scale
     eigvals, eigvecs = np.linalg.eigh(np.cov(z.values, rowvar=False))
     w = eigvecs[:, -1]  # eigh sorts ascending, so the last column is PC1
     if w[0] < 0:
@@ -72,12 +88,13 @@ def fit_factor(factor_returns: pd.DataFrame) -> FactorFit:
         pc1=pc1,
         loadings={col: float(v) for col, v in zip(factor_returns.columns, w, strict=True)},
         explained_variance_ratio=float(eigvals[-1] / eigvals.sum()),
+        scale=scale,
     )
 
 
 @dc.dataclass(frozen=True)
 class CapmFit:
-    alpha: float  # bps per minute
+    alpha: float  # bps per minute (seasonally adjusted)
     beta: float  # bps of BTC per unit of PC1
     r2: float
     resid: pd.Series
@@ -96,46 +113,13 @@ def fit_capm(y: pd.Series, f: pd.Series) -> CapmFit:
     )
 
 
-def fit_resid_garch(resid: pd.Series) -> ARCHModelResult:
-    model = arch_model(
-        resid, mean="AR", lags=1, vol="GARCH", p=1, o=1, q=1, dist="skewt", rescale=False
-    )
-    return model.fit(disp="off", options={"maxiter": 500})
-
-
-def fit_factor_garch(pc1: pd.Series) -> ARCHModelResult:
-    model = arch_model(pc1, mean="Zero", vol="GARCH", p=1, q=1, dist="t", rescale=False)
-    return model.fit(disp="off", options={"maxiter": 500})
-
-
-def _inverse_cdf_rng(fit: ARCHModelResult, gen: np.random.Generator) -> Callable:
-    """Seeded standardized innovations for ``fit``'s distribution (arch's own simulator
-    ignores ``random_state`` for skew-t, so we draw via the inverse CDF instead)."""
-    dist = fit.model.distribution
-    dist_params = fit.params[dist.parameter_names()].values if dist.parameter_names() else None
-    return lambda size: dist.ppf(gen.uniform(size=size), dist_params)
-
-
-def simulate_returns(
-    fit: ARCHModelResult, horizon: int, n_sims: int, gen: np.random.Generator
-) -> np.ndarray:
-    """Simulated future returns, shape (n_sims, horizon)."""
-    fc = fit.forecast(
-        horizon=horizon,
-        method="simulation",
-        simulations=n_sims,
-        reindex=False,
-        rng=_inverse_cdf_rng(fit, gen),
-    )
-    return fc.simulations.values[-1]
-
-
 @dc.dataclass
 class ForecastResult:
     last_time: pd.Timestamp
     last_close: float
     horizon: int
     n_obs: int
+    fit_window_hours: float
     # Stage 1
     alpha_bps: float
     beta: float
@@ -148,86 +132,154 @@ class ForecastResult:
     factor_garch_params: dict[str, float]
     resid_converged: bool
     factor_converged: bool
+    seasonality_active: bool
     # Share of the horizon-H cumulative return variance explained by the factor
     factor_variance_share: float
-    # Conditional volatility history (bps per minute): total and idiosyncratic
+    # Conditional volatility history (bps per minute): total, idiosyncratic, and the
+    # "typical for this time of day" level
     historical_volatility: pd.DataFrame
-    # Forecast paths: cumulative log return (bps) quantiles and price paths
-    cum_return_quantiles: dict[str, np.ndarray]
+    # Forecast paths
+    cum_return_quantiles: dict[str, np.ndarray]  # bps, keys of QUANTILES
     price_quantiles: dict[str, np.ndarray]
     price_mean: np.ndarray
-    cum_return_var: np.ndarray  # forecast variance of cumulative return (bps^2) per step
+    cum_return_var: np.ndarray  # forecast variance of the cumulative return (bps^2) per step
+    cum_q_grid: np.ndarray  # (horizon, len(Q_GRID)) cumulative return quantiles, bps
+
+
+def _split_panel(
+    panel: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None]:
+    if isinstance(panel.columns, pd.MultiIndex):
+        fields = panel.columns.get_level_values(0)
+        high = panel["high"] if "high" in fields else None
+        low = panel["low"] if "low" in fields else None
+        return panel["close"], high, low
+    return panel, None, None
 
 
 def fit_and_forecast(
-    closes: pd.DataFrame,
+    panel: pd.DataFrame,
     target: str,
     factors: list[str],
     horizon: int,
+    profile: SeasonalProfile | None = None,
+    fit_window: dt.timedelta | None = None,
     n_sims: int = N_SIMULATIONS,
     seed: int | None = None,
 ) -> ForecastResult:
-    """Fit both stages on ``closes`` (wide close prices) and forecast ``horizon`` minutes.
+    """Fit on ``panel`` and forecast ``horizon`` minutes ahead.
 
-    ``seed`` defaults to the last bar's timestamp, so a given data snapshot always produces
-    the same bands.
+    ``panel`` is either a wide close-price frame (one column per product) or the
+    (field, product) frame from ``CandleStore.read_panel`` with close/high/low. Without
+    high/low the range term is dropped. ``seed`` defaults to the last bar's timestamp so
+    a given data snapshot always produces the same forecast.
     """
-    returns = build_return_panel(closes[[target, *factors]])
+    closes, high, low = _split_panel(panel)
+    cols = [target, *factors]
+    if fit_window is not None:
+        cutoff = closes.index.max() - fit_window
+        keep = closes.index > cutoff
+        closes = closes.loc[keep]
+        high = high.loc[keep] if high is not None else None
+        low = low.loc[keep] if low is not None else None
+
+    returns = build_return_panel(closes[cols])
     if len(returns) < MIN_OBS:
         raise InsufficientDataError(f"need {MIN_OBS} aligned returns, have {len(returns)}")
+    rv = build_range_panel(high[cols], low[cols], returns.index) if high is not None else None
 
-    factor = fit_factor(returns[factors])
-    capm = fit_capm(returns[target], factor.pc1)
-    resid_fit = fit_resid_garch(capm.resid)
-    factor_fit = fit_factor_garch(factor.pc1)
+    # --- Seasonal adjustment --------------------------------------------------------
+    profile = profile or SeasonalProfile.flat(cols)
+    s = profile.scales(returns)
+    r_adj = returns / s
+    rv_adj = rv / s**2 if rv is not None else None
 
+    # --- Stage 1: factor and CAPM ----------------------------------------------------
+    factor = fit_factor(r_adj[factors])
+    capm = fit_capm(r_adj[target], factor.pc1)
+
+    # --- Stage 2: GJR-GARCH-X for both components, aligned on index[1:] ---------------
+    if rv_adj is not None:
+        # Range proxy for the factor: mean of the basket's standardized range variances.
+        x_factor = (rv_adj[factors] / factor.scale**2).mean(axis=1).to_numpy()
+        x_resid = rv_adj[target].to_numpy()
+    else:
+        x_factor = x_resid = None
+    resid_fit = fit_garch_x(capm.resid.to_numpy(), x_resid, ar=True)
+    factor_fit = fit_garch_x(
+        factor.pc1.to_numpy()[1:], None if x_factor is None else x_factor[1:], ar=False
+    )
+    fit_index = returns.index[1:]
+
+    # --- Simulation -----------------------------------------------------------------
     last_close_series = closes[target].dropna()
-    last_time = last_close_series.index[-1]
+    last_time = pd.Timestamp(last_close_series.index[-1])
     last_close = float(last_close_series.iloc[-1])
     if seed is None:
-        seed = int(pd.Timestamp(last_time).timestamp())
+        seed = int(last_time.timestamp())
     gen = np.random.default_rng(seed)
 
-    f_sims = simulate_returns(factor_fit, horizon, n_sims, gen)
-    e_sims = simulate_returns(resid_fit, horizon, n_sims, gen)
-    cum = np.cumsum(capm.alpha + capm.beta * f_sims + e_sims, axis=1)  # bps
-    cum_factor = np.cumsum(capm.beta * f_sims, axis=1)
+    f_sims, e_sims = simulate_fhs([factor_fit, resid_fit], horizon, n_sims, gen)
+    future = pd.date_range(last_time + pd.Timedelta(minutes=1), periods=horizon, freq="1min")
+    s_future = profile.scale_at(target, future)
+    steps_factor = capm.beta * f_sims * s_future
+    steps = steps_factor + e_sims * s_future  # zero drift: no alpha
+    cum = np.cumsum(steps, axis=1)
+    cum_factor = np.cumsum(steps_factor, axis=1)
 
     cum_q = {k: np.quantile(cum, q, axis=0) for k, q in QUANTILES.items()}
     price_q = {k: last_close * np.exp(v / BPS) for k, v in cum_q.items()}
-    cum_var = cum.var(axis=0)
 
-    sigma_f = factor_fit.conditional_volatility
-    sigma_e = resid_fit.conditional_volatility
-    hist = pd.DataFrame(
-        {
-            "total": np.sqrt(capm.beta**2 * sigma_f**2 + sigma_e**2),
-            "idiosyncratic": sigma_e,
-        }
-    ).dropna()
+    hist = _historical_volatility(capm.beta, factor_fit, resid_fit, profile, target, fit_index)
 
-    def finite_params(fit: ARCHModelResult) -> dict[str, float]:
-        return {k: float(v) for k, v in fit.params.items() if np.isfinite(v)}
+    def report(fit: GarchXFit) -> dict[str, float]:
+        out = {k: v for k, v in fit.params.items() if np.isfinite(v)}
+        out["persistence"] = fit.persistence()
+        return out
 
+    span = (closes.index.max() - closes.index.min()) / pd.Timedelta(hours=1)
     return ForecastResult(
-        last_time=pd.Timestamp(last_time),
+        last_time=last_time,
         last_close=last_close,
         horizon=horizon,
         n_obs=len(returns),
+        fit_window_hours=float(fit_window / pd.Timedelta(hours=1)) if fit_window else float(span),
         alpha_bps=capm.alpha,
         beta=capm.beta,
         capm_r2=capm.r2,
         pca_explained_variance_ratio=factor.explained_variance_ratio,
         pca_loadings=factor.loadings,
         resid_std_bps=float(capm.resid.std()),
-        resid_garch_params=finite_params(resid_fit),
-        factor_garch_params=finite_params(factor_fit),
-        resid_converged=resid_fit.convergence_flag == 0,
-        factor_converged=factor_fit.convergence_flag == 0,
+        resid_garch_params=report(resid_fit),
+        factor_garch_params=report(factor_fit),
+        resid_converged=resid_fit.converged,
+        factor_converged=factor_fit.converged,
+        seasonality_active=profile.active,
         factor_variance_share=float(cum_factor[:, -1].var() / cum[:, -1].var()),
         historical_volatility=hist,
         cum_return_quantiles=cum_q,
         price_quantiles=price_q,
         price_mean=last_close * np.exp(cum / BPS).mean(axis=0),
-        cum_return_var=cum_var,
+        cum_return_var=cum.var(axis=0),
+        cum_q_grid=np.quantile(cum, Q_GRID, axis=0).T,
     )
+
+
+def _historical_volatility(
+    beta: float,
+    factor_fit: GarchXFit,
+    resid_fit: GarchXFit,
+    profile: SeasonalProfile,
+    target: str,
+    index: pd.DatetimeIndex,
+) -> pd.DataFrame:
+    s = profile.scale_at(target, index)
+    total_adj2 = beta**2 * factor_fit.sigma2 + resid_fit.sigma2
+    return pd.DataFrame(
+        {
+            "total": s * np.sqrt(total_adj2),
+            "idiosyncratic": s * np.sqrt(resid_fit.sigma2),
+            "typical": s * np.sqrt(total_adj2.mean()),
+        },
+        index=index,
+    ).dropna()

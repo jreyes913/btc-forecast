@@ -1,8 +1,15 @@
-"""Coinbase 1-minute candle ingestion into a rolling DuckDB window.
+"""Coinbase 1-minute candle ingestion into a rolling DuckDB store.
 
-DuckDB is the single source of truth. Each tick fetches only the bars missing since the
-last stored bar for each product (so restarts and outages backfill themselves), upserts
-them, and prunes anything older than ``WINDOW`` so the table stays bounded.
+DuckDB is the single source of truth for *closed* bars. Each sync:
+
+1. fills the **tail**, from the last stored bar to the last closed minute, so restarts
+   and outages backfill themselves; a fresh install gets the most recent bars first;
+2. extends the **head** backwards towards ``STORE_WINDOW``, a few requests at a time,
+   so a long history fills in without delaying the first forecast;
+3. prunes anything older than ``STORE_WINDOW`` so the table stays bounded.
+
+The bar that is still forming is never stored. ``LivePoller`` keeps it in memory for
+the chart only.
 """
 
 from __future__ import annotations
@@ -17,15 +24,25 @@ import duckdb as dd
 import pandas as pd
 import requests as rq
 
-from src.settings import COINBASE_URL_TEMPLATE, PRODUCTS, WINDOW
+from src.settings import (
+    COINBASE_URL_TEMPLATE,
+    FIT_WINDOW,
+    LIVE_POLL_SECONDS,
+    PRODUCTS,
+    STORE_WINDOW,
+    SYNC_EVERY_SECONDS,
+    TARGET,
+)
 
 log = logging.getLogger(__name__)
 
 COLS = ["time", "low", "high", "open", "close", "volume"]  # Coinbase response order
 MAX_BARS_PER_REQUEST = 300
+HEAD_REQUESTS_PER_SYNC = 12
 REQUEST_SPACING_S = 0.2
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 CHECKPOINT_EVERY = dt.timedelta(hours=1)
+ONE_MIN = dt.timedelta(minutes=1)
 
 
 def floor_minute(ts: dt.datetime) -> dt.datetime:
@@ -37,7 +54,7 @@ class CandleStore:
 
     def __init__(self, con: dd.DuckDBPyConnection):
         self.con = con
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         with self.lock:
             self.con.execute("SET TimeZone = 'UTC'")
             self.con.execute(
@@ -70,14 +87,24 @@ class CandleStore:
         with self.lock:
             self.con.execute("CHECKPOINT")
 
-    def last_time(self, product: str) -> dt.datetime | None:
+    def _scalar_time(self, agg: str, product: str) -> dt.datetime | None:
         with self.lock:
             # .df() rather than fetchall(): DuckDB's Python conversion of TIMESTAMPTZ
             # scalars needs pytz, while the pandas path does not.
-            last = self.con.execute(
-                "SELECT max(time) AS t FROM candles WHERE product = ?", [product]
-            ).df()["t"].iloc[0]
-        return None if pd.isna(last) else last.to_pydatetime()
+            value = (
+                self.con.execute(
+                    f"SELECT {agg}(time) AS t FROM candles WHERE product = ?", [product]
+                )
+                .df()["t"]
+                .iloc[0]
+            )
+        return None if pd.isna(value) else value.to_pydatetime()
+
+    def last_time(self, product: str) -> dt.datetime | None:
+        return self._scalar_time("max", product)
+
+    def first_time(self, product: str) -> dt.datetime | None:
+        return self._scalar_time("min", product)
 
     def read_candles(self, product: str, since: dt.datetime | None = None) -> pd.DataFrame:
         query = "SELECT time, open, high, low, close, volume FROM candles WHERE product = ?"
@@ -88,16 +115,35 @@ class CandleStore:
         with self.lock:
             return self.con.execute(query + " ORDER BY time", params).df()
 
-    def read_closes(self, products: Iterable[str]) -> pd.DataFrame:
-        """Close prices as a wide frame: index = time (UTC), one column per product."""
-        products = list(products)
+    def read_panel(
+        self,
+        products: Iterable[str],
+        fields: Iterable[str] = ("close", "high", "low"),
+        since: dt.datetime | None = None,
+        until: dt.datetime | None = None,
+    ) -> pd.DataFrame:
+        """Wide frame indexed by time with (field, product) MultiIndex columns."""
+        products, fields = list(products), list(fields)
+        query = (
+            f"SELECT time, product, {', '.join(fields)} FROM candles "
+            "WHERE list_contains(?, product)"
+        )
+        params: list = [products]
+        if since is not None:
+            query += " AND time > ?"
+            params.append(since)
+        if until is not None:
+            query += " AND time <= ?"
+            params.append(until)
         with self.lock:
-            df = self.con.execute(
-                "SELECT time, product, close FROM candles WHERE list_contains(?, product)",
-                [products],
-            ).df()
-        wide = df.pivot(index="time", columns="product", values="close").sort_index()
-        return wide.reindex(columns=products)
+            df = self.con.execute(query, params).df()
+        wide = df.pivot(index="time", columns="product", values=fields).sort_index()
+        cols = pd.MultiIndex.from_product([fields, products])
+        return wide.reindex(columns=cols)
+
+    def read_closes(self, products: Iterable[str], **kwargs) -> pd.DataFrame:
+        """Close prices as a wide frame: index = time (UTC), one column per product."""
+        return self.read_panel(products, fields=("close",), **kwargs)["close"]
 
 
 class CoinbaseClient:
@@ -128,14 +174,14 @@ class CoinbaseClient:
         rows: list = []
         chunk_start = start
         while chunk_start <= end:
-            chunk_end = min(chunk_start + dt.timedelta(minutes=MAX_BARS_PER_REQUEST - 1), end)
+            chunk_end = min(chunk_start + (MAX_BARS_PER_REQUEST - 1) * ONE_MIN, end)
             params = {
                 "granularity": 60,
                 "start": chunk_start.isoformat(),
                 "end": chunk_end.isoformat(),
             }
             rows += self._get(url, params)
-            chunk_start = chunk_end + dt.timedelta(minutes=1)
+            chunk_start = chunk_end + ONE_MIN
             tm.sleep(REQUEST_SPACING_S)
 
         df = pd.DataFrame(rows, columns=COLS)
@@ -146,7 +192,7 @@ class CoinbaseClient:
 
 
 class CandleWorker:
-    """Keeps ``store`` in sync with Coinbase and calls ``on_update`` after each tick."""
+    """Keeps ``store`` in sync with Coinbase and calls ``on_update`` when bars arrive."""
 
     def __init__(
         self,
@@ -154,41 +200,77 @@ class CandleWorker:
         client: CoinbaseClient | None = None,
         products: Iterable[str] = PRODUCTS,
         on_update: Callable[[], None] | None = None,
+        store_window: dt.timedelta = STORE_WINDOW,
+        initial_window: dt.timedelta = FIT_WINDOW,
     ):
         self.store = store
         self.client = client or CoinbaseClient()
         self.products = list(products)
         self.on_update = on_update
+        self.store_window = store_window
+        self.initial_window = initial_window
+        self._head_done: set[str] = set()
         self._last_checkpoint = dt.datetime.now(dt.UTC)
 
-    def sync_product(self, product: str, now: dt.datetime) -> int:
-        """Fetch every closed bar missing for ``product``; returns the number fetched."""
+    def sync_tail(self, product: str, now: dt.datetime) -> int:
+        """Fetch closed bars after the last stored one. Returns the number fetched."""
         current_minute = floor_minute(now)
-        last_closed = current_minute - dt.timedelta(minutes=1)  # current bar is still forming
-        window_start = current_minute - WINDOW
-
+        last_closed = current_minute - ONE_MIN  # the current bar is still forming
         last = self.store.last_time(product)
-        # Re-fetch a couple of bars of overlap: Coinbase occasionally revises the latest bar.
-        start = window_start if last is None else max(last - dt.timedelta(minutes=2), window_start)
-        if start > last_closed:
-            return 0
-
+        if last is not None and last >= last_closed:
+            return 0  # up to date: no request
+        if last is None:
+            start = current_minute - self.initial_window  # newest data first on a fresh DB
+        else:
+            # Re-fetch two bars of overlap: Coinbase occasionally revises the latest bar.
+            start = max(last - 2 * ONE_MIN, current_minute - self.store_window)
         df = self.client.fetch_minute_candles(product, start, last_closed)
         self.store.upsert(df)
         return len(df)
 
+    def sync_head(self, product: str, now: dt.datetime) -> int:
+        """Extend history backwards towards ``store_window``, a bounded chunk per call."""
+        if product in self._head_done:
+            return 0
+        first = self.store.first_time(product)
+        window_start = floor_minute(now) - self.store_window
+        if first is None:
+            return 0
+        if first <= window_start + ONE_MIN:
+            self._head_done.add(product)
+            return 0
+        end = first - ONE_MIN
+        start = max(
+            window_start, end - (HEAD_REQUESTS_PER_SYNC * MAX_BARS_PER_REQUEST - 1) * ONE_MIN
+        )
+        df = self.client.fetch_minute_candles(product, start, end)
+        if df.empty:
+            # Nothing older exists (e.g. a recent listing); stop asking.
+            self._head_done.add(product)
+            return 0
+        self.store.upsert(df)
+        return len(df)
+
     def tick(self, now: dt.datetime | None = None) -> dict[str, int | None]:
-        """Sync every product independently; a failure in one doesn't skip the others."""
+        """Sync every product independently; a failure in one doesn't skip the others.
+
+        Returns the number of *new tail* bars per product (None on failure).
+        """
         now = now or dt.datetime.now(dt.UTC)
         fetched: dict[str, int | None] = {}
         for product in self.products:
             try:
-                fetched[product] = self.sync_product(product, now)
+                fetched[product] = self.sync_tail(product, now)
             except (rq.RequestException, ValueError) as err:
                 log.warning("Sync failed for %s: %s", product, err)
                 fetched[product] = None
+        for product in self.products:
+            try:
+                self.sync_head(product, now)
+            except (rq.RequestException, ValueError) as err:
+                log.warning("History backfill failed for %s: %s", product, err)
 
-        self.store.prune(floor_minute(now) - WINDOW)
+        self.store.prune(floor_minute(now) - self.store_window)
         if now - self._last_checkpoint >= CHECKPOINT_EVERY:
             self.store.checkpoint()
             self._last_checkpoint = now
@@ -198,11 +280,50 @@ class CandleWorker:
         stop = stop or threading.Event()
         while not stop.is_set():
             fetched = self.tick()
-            log.info("Synced candles: %s", fetched)
-            if self.on_update is not None:
-                try:
-                    self.on_update()
-                except Exception:  # keep ingesting even if the model blows up
-                    log.exception("on_update callback failed")
-            # Wake a couple of seconds after each minute boundary so the bar has closed.
-            stop.wait(60 - tm.time() % 60 + 2)
+            if any(fetched.values()):
+                log.info("New candles: %s", fetched)
+                if self.on_update is not None:
+                    try:
+                        self.on_update()
+                    except Exception:  # keep ingesting even if the model blows up
+                        log.exception("on_update callback failed")
+            stop.wait(SYNC_EVERY_SECONDS)
+
+
+class LivePoller:
+    """Polls the bar that is still forming, for display only. It is never stored."""
+
+    def __init__(self, client: CoinbaseClient | None = None, product: str = TARGET):
+        self.client = client or CoinbaseClient(max_retries=1)
+        self.product = product
+        self._lock = threading.Lock()
+        self._bar: dict | None = None
+
+    def poll(self, now: dt.datetime | None = None) -> dict | None:
+        now = now or dt.datetime.now(dt.UTC)
+        current_minute = floor_minute(now)
+        df = self.client.fetch_minute_candles(
+            self.product, current_minute - ONE_MIN, current_minute
+        )
+        forming = df.loc[df["time"] == current_minute]
+        bar = None
+        if not forming.empty:
+            row = forming.iloc[-1]
+            bar = {k: float(row[k]) for k in ("open", "high", "low", "close", "volume")}
+            bar["time"] = row["time"].to_pydatetime()
+        with self._lock:
+            self._bar = bar
+        return bar
+
+    @property
+    def bar(self) -> dict | None:
+        with self._lock:
+            return self._bar
+
+    def run(self, stop: threading.Event) -> None:
+        while not stop.is_set():
+            try:
+                self.poll()
+            except rq.RequestException as err:
+                log.debug("Live poll failed: %s", err)
+            stop.wait(LIVE_POLL_SECONDS)
