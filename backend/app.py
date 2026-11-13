@@ -9,10 +9,11 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
 
-from src.models.api import CandleSchema, ForecastResponse, LiveResponse
+from src.models.api import CandleSchema, ForecastResponse, LadderResponse, LiveResponse
 from src.services.candles import CandleStore, CandleWorker, LivePoller
 from src.services.evaluation import Replayer, baseline_records, factor_records, window_label
 from src.services.forecast_cache import ForecastCache
+from src.services.ladder import build_ladder
 from src.services.quant import ForecastResult, InsufficientDataError
 from src.services.scoring import REFERENCE_MODEL, ForecastLog, summarize
 from src.settings import (
@@ -24,6 +25,8 @@ from src.settings import (
     FORECAST_HORIZON_DEFAULT,
     FORECAST_HORIZON_MAX,
     FORECAST_LOG_RETENTION,
+    LADDER_EDGE_POINTS,
+    LADDER_STRIKE_STEP,
     LOG_EVERY_MINUTES,
     PRODUCTS,
     TARGET,
@@ -158,6 +161,24 @@ def create_app(store: CandleStore | None = None, start_worker: bool = True) -> F
             "cone_origin_time": latest.last_time if latest else None,
             "cone_origin_price": latest.last_close if latest else None,
         }
+
+    @app.get("/ladder", response_model=LadderResponse)
+    def get_ladder(which: str = Query(default="next", pattern="^(next|following)$")):
+        try:
+            cone = app.state.cache.get(FORECAST_HORIZON_DEFAULT)
+        except (LookupError, InsufficientDataError) as err:
+            raise HTTPException(status_code=503, detail=f"Model not ready: {err}") from err
+        bar = app.state.live.bar
+        # Only anchor on the live bar if it's newer than the cone's origin.
+        live_price = bar["close"] if bar and bar["time"] > cone.last_time else None
+        return build_ladder(
+            cone,
+            dt.datetime.now(dt.UTC),
+            live_price,
+            which,
+            step=LADDER_STRIKE_STEP,
+            edge=LADDER_EDGE_POINTS,
+        )
 
     @app.get("/backtest")
     def get_backtest(source: str = Query(default="all", pattern="^(all|live|replay)$")):

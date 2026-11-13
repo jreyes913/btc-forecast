@@ -27,12 +27,20 @@ CHART_WINDOW = dt.timedelta(hours=72)
 # minutes (a no-trade minute is a zero return). Longer holes are dropped from the panel.
 MAX_FFILL_MINUTES = 5
 
-FORECAST_HORIZON_DEFAULT = 60
+# 120 minutes so the cone always covers the next *and* the following top-of-hour
+# deadline (the next one can be up to ~61 minutes past the cone's origin).
+FORECAST_HORIZON_DEFAULT = 120
 FORECAST_HORIZON_MAX = 240
 N_SIMULATIONS = 1000
-# Which forecaster draws the dashboard cone: "factor", or "ensemble" (equal-weight
-# quantile average of factor, GJR-only and EWMA). Scoring always tracks both.
-CONE_MODEL = "factor"
+# Which forecaster draws the dashboard cone and strike table: "ensemble" (equal-weight
+# quantile average of factor, GJR-only and EWMA; best or tied-best on real-data
+# scoring at 15-60 minutes) or "factor". Scoring always logs every model separately.
+CONE_MODEL = "ensemble"
+
+# Strike table: Kalshi's strike spacing, and the minimum gap (in percentage points)
+# between the model's probability and the price before a trade is worth taking.
+LADDER_STRIKE_STEP = 100.0
+LADDER_EDGE_POINTS = 10
 
 # Adaptive ensembles (scored challengers). Each resolved outcome updates a discounted
 # score per member: S <- FORGETTING * S + score; weights = softmax(S). 0.99 remembers

@@ -2,13 +2,16 @@ import { useCallback, useRef, useState } from "react";
 import {
   getJson,
   type BacktestResponse,
-  type BacktestSource,
   type Candle,
   type ForecastResponse,
+  type LadderResponse,
   type LiveResponse,
 } from "./api";
 import { BtcChart } from "./components/BtcChart";
+import { Insights } from "./components/Insights";
 import { MetricsPanel } from "./components/MetricsPanel";
+import { ReliabilityCard } from "./components/ReliabilityCard";
+import { StrikeLadder } from "./components/StrikeLadder";
 import { VolatilityChart } from "./components/VolatilityChart";
 import { usePolling } from "./hooks/usePolling";
 import { colors } from "./theme";
@@ -29,8 +32,12 @@ function mergeCandles(prev: Candle[], incoming: Candle[]): Candle[] {
 function App() {
   const [candles, setCandles] = useState<Candle[]>([]);
   const [forecast, setForecast] = useState<ForecastResponse | null>(null);
-  const [backtests, setBacktests] = useState<Partial<Record<BacktestSource, BacktestResponse>>>({});
+  const [backtest, setBacktest] = useState<BacktestResponse | null>(null);
   const [live, setLive] = useState<LiveResponse | null>(null);
+  const [ladder, setLadder] = useState<LadderResponse | null>(null);
+  const [which, setWhich] = useState<"next" | "following">("next");
+  const whichRef = useRef(which);
+  whichRef.current = which;
   const lastCandleRef = useRef<string | null>(null);
 
   const candleStatus = usePolling(
@@ -57,17 +64,33 @@ function App() {
     10_000,
   );
 
+  const ladderTask = useCallback(async (signal: AbortSignal) => {
+    const res = await getJson<LadderResponse>(`/ladder?which=${whichRef.current}`, signal);
+    if (res.which === whichRef.current) setLadder(res);
+  }, []);
+  const ladderStatus = usePolling(ladderTask, 15_000, 5_000);
+
+  const chooseWhich = (w: "next" | "following") => {
+    setWhich(w);
+    whichRef.current = w;
+    setLadder(null);
+    ladderTask(new AbortController().signal).catch(() => undefined);
+  };
+
   const backtestStatus = usePolling(
     useCallback(async (signal: AbortSignal) => {
-      const sources: BacktestSource[] = ["all", "live", "replay"];
-      const results = await Promise.all(
-        sources.map((s) => getJson<BacktestResponse>(`/backtest?source=${s}`, signal)),
-      );
-      setBacktests(Object.fromEntries(sources.map((s, i) => [s, results[i]])));
+      setBacktest(await getJson<BacktestResponse>("/backtest?source=all", signal));
     }, []),
     2 * 60_000,
     30_000,
   );
+
+  const twoUp = {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 520px), 1fr))",
+    gap: "1rem",
+    marginBottom: "1rem",
+  } as const;
 
   return (
     <main
@@ -85,14 +108,12 @@ function App() {
         </div>
       )}
 
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 520px), 1fr))",
-          gap: "1rem",
-          marginBottom: "1rem",
-        }}
-      >
+      <div style={{ ...twoUp, alignItems: "start" }}>
+        <StrikeLadder ladder={ladder} status={ladderStatus} which={which} onWhich={chooseWhich} />
+        <Insights forecast={forecast} />
+      </div>
+
+      <div style={twoUp}>
         <BtcChart
           candles={candles}
           forecast={forecast?.forecast ?? []}
@@ -102,12 +123,15 @@ function App() {
         <VolatilityChart data={forecast?.historical_volatility ?? []} />
       </div>
 
-      <MetricsPanel
-        metrics={forecast?.metrics ?? null}
-        diagnostics={forecast?.diagnostics ?? null}
-        backtests={backtests}
-        backtestStatus={backtestStatus}
-      />
+      <div style={{ marginBottom: "1rem" }}>
+        <ReliabilityCard
+          backtest={backtest}
+          status={backtestStatus}
+          model={forecast?.diagnostics.cone_model ?? "ensemble"}
+        />
+      </div>
+
+      <MetricsPanel metrics={forecast?.metrics ?? null} diagnostics={forecast?.diagnostics ?? null} />
     </main>
   );
 }

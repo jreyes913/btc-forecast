@@ -133,9 +133,9 @@ export function BtcChart({ candles, forecast, live, status }: Props) {
       height={420}
       legend={
         <>
-          Cone: median (solid), 68% band (dashed), 95% band (dotted), from Monte Carlo paths
-          of factor + idiosyncratic GARCH shocks. Drift is ≈ 0 at this horizon; the width is
-          the forecast.
+          Cone: middle (solid), 68% range (dashed), 95% range (dotted) for the next two hours.
+          It shows how far BTC is likely to move, not which way. The strike table above turns
+          it into chances for each Kalshi strike.
         </>
       }
     />

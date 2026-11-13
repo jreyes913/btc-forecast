@@ -120,3 +120,18 @@ def test_invalid_cone_model_rejected(client):
 
     with pytest.raises(ValueError):
         ForecastCache(client.app.state.store, "BTC-USD", [], cone_model="bogus")
+
+
+def test_ladder_endpoint(client):
+    body = client.get("/ladder").json()
+    assert body["cone_model"] == "ensemble"
+    assert body["which"] == "next"
+    # Synthetic data ends days ago, so "now" is far past the cone: not available
+    assert body["available"] is False and body["rows"] == []
+    assert client.get("/ladder", params={"which": "bogus"}).status_code == 422
+
+
+def test_ladder_503_when_empty():
+    store = CandleStore(dd.connect(":memory:"))
+    with TestClient(create_app(store=store, start_worker=False)) as c:
+        assert c.get("/ladder").status_code == 503
