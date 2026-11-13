@@ -91,6 +91,7 @@ def test_backtest_summary_by_source(client):
     assert rows["factor"]["n"] == 40 and rows["factor"]["brier"] is not None
     assert "dm_p_value" in rows["ewma"]
     assert body["calibration"] and "replay_progress" in body
+    assert "ensemble_weights" in body
     assert client.get("/backtest", params={"source": "replay"}).json()["rows"] == []
     assert client.get("/backtest", params={"source": "bogus"}).status_code == 422
     assert np.isfinite(rows["factor"]["qlike"])

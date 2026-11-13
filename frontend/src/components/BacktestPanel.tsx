@@ -1,5 +1,5 @@
 import { useState, type CSSProperties } from "react";
-import type { BacktestResponse, BacktestRow, BacktestSource } from "../api";
+import type { BacktestResponse, BacktestRow, BacktestSource, EnsembleWeights } from "../api";
 import { buttonStyle, cardStyle, colors } from "../theme";
 import { CalibrationChart } from "./CalibrationChart";
 
@@ -15,7 +15,67 @@ function modelLabel(model: string): string {
   if (model === "gjr") return "GJR-GARCH only";
   if (model === "ewma") return "EWMA";
   if (model === "ensemble") return "Ensemble (avg of 3)";
+  if (model === "ensemble_bma") return "Ensemble (Bayesian weights)";
+  if (model === "ensemble_loss") return "Ensemble (loss weights)";
   return model;
+}
+
+const MEMBERS = [
+  { key: "factor", label: "Factor", color: colors.accent },
+  { key: "gjr", label: "GJR", color: colors.vol },
+  { key: "ewma", label: "EWMA", color: colors.volIdio },
+] as const;
+
+/** Latest adaptive-ensemble weights: one stacked bar per variant x source x horizon. */
+function WeightsTable({ weights }: { weights: EnsembleWeights[] }) {
+  if (!weights.length) return null;
+  const rows = [...weights].sort(
+    (a, b) =>
+      a.variant.localeCompare(b.variant) || a.source.localeCompare(b.source) || a.horizon - b.horizon,
+  );
+  const cell: CSSProperties = { padding: "0.2rem 0.5rem", whiteSpace: "nowrap" };
+  return (
+    <div style={{ overflowX: "auto" }}>
+      <div style={{ color: colors.textMuted, fontSize: "0.75rem", marginBottom: "0.3rem" }}>
+        Current adaptive weights. Each resolved forecast shifts weight toward the member that
+        predicted it best, and older evidence fades (forgetting factor), so the weights can move
+        with market regimes.{" "}
+        {MEMBERS.map((m) => (
+          <span key={m.key} style={{ marginRight: "0.5rem" }}>
+            <span style={{ color: m.color }}>■</span> {m.label}
+          </span>
+        ))}
+      </div>
+      <table style={{ borderCollapse: "collapse", fontSize: "0.78rem", color: colors.textBody, width: "100%" }}>
+        <tbody>
+          {rows.map((w) => (
+            <tr key={`${w.variant}-${w.source}-${w.horizon}`}>
+              <td style={cell}>{w.variant === "ensemble_bma" ? "Bayesian" : "Loss-based"}</td>
+              <td style={cell}>{w.source}</td>
+              <td style={{ ...cell, textAlign: "right" }}>{w.horizon}m</td>
+              <td style={{ ...cell, width: "55%", minWidth: 140 }}>
+                <div style={{ display: "flex", height: 10, borderRadius: 3, overflow: "hidden" }}>
+                  {MEMBERS.map((m) => (
+                    <div
+                      key={m.key}
+                      title={`${m.label}: ${(w.weights[m.key] * 100).toFixed(1)}%`}
+                      style={{ width: `${w.weights[m.key] * 100}%`, backgroundColor: m.color }}
+                    />
+                  ))}
+                </div>
+              </td>
+              <td style={{ ...cell, color: colors.textMuted }}>
+                {MEMBERS.map((m) => `${Math.round(w.weights[m.key] * 100)}%`).join(" / ")}
+              </td>
+              <td style={{ ...cell, color: colors.textMuted, textAlign: "right" }}>
+                {w.updates.toLocaleString()} updates
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
 }
 
 function coverageColor(actual: number, nominal: number) {
@@ -130,6 +190,8 @@ export function BacktestPanel({ backtests, status }: Props) {
               </tbody>
             </table>
           </div>
+
+          <WeightsTable weights={bt?.ensemble_weights ?? []} />
 
           {bt?.recommended_fit_window && (
             <div style={{ fontSize: "0.8rem", color: colors.textBody }}>

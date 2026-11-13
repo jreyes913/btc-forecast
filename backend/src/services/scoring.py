@@ -35,7 +35,7 @@ from scipy.stats import norm
 
 from src.services.candles import CandleStore
 from src.services.quant import Q_GRID
-from src.settings import MAX_FFILL_MINUTES, TARGET
+from src.settings import ENSEMBLE_FORGETTING, ENSEMBLE_LOSS_ETA, MAX_FFILL_MINUTES, TARGET
 
 REFERENCE_MODEL = "factor"
 ENSEMBLE_MODEL = "ensemble"
@@ -267,50 +267,167 @@ def _qlike(var: np.ndarray, r: np.ndarray) -> np.ndarray:
     return np.log(var) + r**2 / var
 
 
-def combine_quantiles(q: np.ndarray, var: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Equal-weight quantile averaging (Vincentization) over axis 1.
+def combine_quantiles(
+    q: np.ndarray, var: np.ndarray, weights: np.ndarray | None = None
+) -> tuple[np.ndarray, np.ndarray]:
+    """Weighted quantile averaging (Vincentization) over axis 1.
 
-    ``q`` has shape (n, members, len(Q_GRID)) and ``var`` (n, members). The combined
-    variance is (mean SD)^2, consistent with averaging location-scale quantiles.
+    ``q`` has shape (n, members, len(Q_GRID)), ``var`` (n, members) and ``weights``
+    (n, members), rows summing to 1 (equal weights if omitted). The combined variance
+    is (weighted mean SD)^2, consistent with averaging location-scale quantiles.
     Averaging quantiles keeps the bands sharp; averaging CDFs (a linear pool) would
     widen them, which is the opposite of what these forecasts need.
     """
-    return q.mean(axis=1), np.sqrt(var).mean(axis=1) ** 2
+    if weights is None:
+        return q.mean(axis=1), np.sqrt(var).mean(axis=1) ** 2
+    q_comb = np.einsum("nk,nkg->ng", weights, q)
+    sd = np.einsum("nk,nk->n", weights, np.sqrt(var))
+    return q_comb, sd**2
 
 
-def add_ensemble(df: pd.DataFrame) -> pd.DataFrame:
-    """Append ``ensemble`` rows built from logged member forecasts.
+def quantile_density(q: np.ndarray, x: np.ndarray) -> np.ndarray:
+    """Predictive density at ``x`` (n,) implied by quantile rows ``q`` (n, len(Q_GRID)).
+
+    Between the 1st and 99th percentiles the density is piecewise constant, matching the
+    piecewise-linear CDF in ``quantile_cdf``. Beyond them the tails are exponential,
+    continuing the decay between the 95th and 99th percentiles (scale (q99 - q95) / ln 5),
+    so each tail holds exactly the 1% of mass the grid leaves outside.
+    """
+    q = np.maximum.accumulate(q, axis=1)
+    g = len(Q_GRID)
+    rows = np.arange(len(q))
+    j = np.clip((x[:, None] >= q).sum(axis=1) - 1, 0, g - 2)
+    width = np.maximum(q[rows, j + 1] - q[rows, j], 1e-9)
+    inner = (Q_GRID[j + 1] - Q_GRID[j]) / width
+
+    i05, i95 = int(np.argmin(abs(Q_GRID - 0.05))), int(np.argmin(abs(Q_GRID - 0.95)))
+    tail_lo, tail_hi = Q_GRID[0], 1.0 - Q_GRID[-1]
+    s_hi = np.maximum(q[:, -1] - q[:, i95], 1e-9) / np.log((1 - Q_GRID[i95]) / tail_hi)
+    s_lo = np.maximum(q[:, i05] - q[:, 0], 1e-9) / np.log(Q_GRID[i05] / tail_lo)
+    upper = tail_hi / s_hi * np.exp(-np.maximum(x - q[:, -1], 0.0) / s_hi)
+    lower = tail_lo / s_lo * np.exp(-np.maximum(q[:, 0] - x, 0.0) / s_lo)
+    dens = np.where(x > q[:, -1], upper, np.where(x < q[:, 0], lower, inner))
+    return np.maximum(dens, 1e-12)
+
+
+def pinball_loss(q: np.ndarray, r: np.ndarray) -> np.ndarray:
+    """Mean quantile (pinball) loss across ``Q_GRID``: an approximation of CRPS."""
+    diff = r[:, None] - q
+    return np.mean(np.maximum(Q_GRID * diff, (Q_GRID - 1) * diff), axis=1)
+
+
+def sequential_weights(
+    origins: np.ndarray, horizon: int, scores: np.ndarray, forgetting: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Causal, discounted model weights for forecasts ordered by origin time.
+
+    ``scores`` (n, members) is each member's score for each forecast's outcome. An
+    outcome only becomes known at origin + horizon, so it updates the state only for
+    origins at or after that time: no forecast's weights use information from its own
+    future. State update per resolved outcome: S <- forgetting * S + score; weights are
+    softmax(S), starting from equal weights. Returns the per-origin weights (n, members)
+    and the latest weights after every outcome is in (members,).
+    """
+    n, k = scores.shape
+    resolve = origins + np.timedelta64(int(horizon), "m")
+    state = np.zeros(k)
+    weights = np.empty((n, k))
+    j = 0
+    for i in range(n):
+        while j < n and resolve[j] <= origins[i]:
+            state = forgetting * state + scores[j]
+            j += 1
+        w = np.exp(state - state.max())
+        weights[i] = w / w.sum()
+    for jj in range(j, n):
+        state = forgetting * state + scores[jj]
+    latest = np.exp(state - state.max())
+    return weights, latest / latest.sum()
+
+
+def ensemble_frames(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
+    """Append the three ensemble variants built from logged member forecasts.
+
+    * ``ensemble``: equal weights.
+    * ``ensemble_bma``: dynamic Bayesian model averaging; each resolved outcome
+      multiplies a member's weight by its predictive density there (with forgetting).
+    * ``ensemble_loss``: weights from discounted relative pinball loss, more robust to
+      how the tails are interpolated from the logged quantiles.
 
     One row per (origin, horizon, source) where every member in ``ENSEMBLE_MEMBERS``
-    was logged. Built at summary time, so historical forecasts get scored too.
+    was logged. Built at summary time, so historical forecasts get scored too. Also
+    returns the latest adaptive weights per (variant, source, horizon).
     """
     keys = ["origin_time", "horizon", "source"]
     members = df.loc[df["model"].isin(ENSEMBLE_MEMBERS)] if not df.empty else df
     if members.empty:
-        return df
+        return df, []
     counts = members.groupby(keys)["model"].nunique()
     complete = counts[counts == len(ENSEMBLE_MEMBERS)].index.to_frame(index=False)
     if complete.empty:
-        return df
-    m = members.merge(complete, on=keys).sort_values([*keys, "model"])
+        return df, []
     k = len(ENSEMBLE_MEMBERS)
-    q = np.vstack(m["q"].to_numpy()).reshape(-1, k, len(Q_GRID))
-    var = m["var_bps2"].to_numpy().reshape(-1, k)
-    q_ens, var_ens = combine_quantiles(q, var)
+    m = members.merge(complete, on=keys)
+    m["_member"] = m["model"].map({name: i for i, name in enumerate(ENSEMBLE_MEMBERS)})
+    m = m.sort_values(["source", "horizon", "origin_time", "_member"])
 
-    ens = m.iloc[::k][[*keys, "origin_price", "realized_bps"]].copy()
-    ens["model"] = ENSEMBLE_MODEL
-    ens["var_bps2"] = var_ens
-    ens["q"] = list(q_ens)
-    return pd.concat([df, ens.reindex(columns=df.columns)], ignore_index=True)
+    frames, latest = [], []
+    for (source, h), g in m.groupby(["source", "horizon"], sort=False):
+        q = np.vstack(g["q"].to_numpy()).reshape(-1, k, len(Q_GRID))
+        var = g["var_bps2"].to_numpy().reshape(-1, k)
+        base = g.iloc[::k][[*keys, "origin_price", "realized_bps"]]
+        r = base["realized_bps"].to_numpy()
+        origins = base["origin_time"].to_numpy(dtype="datetime64[ns]")
+
+        loglik = np.column_stack([np.log(quantile_density(q[:, i], r)) for i in range(k)])
+        loss = np.column_stack([pinball_loss(q[:, i], r) for i in range(k)])
+        # Scale by the members' average forecast SD, known *before* the outcome. Dividing
+        # by the realized loss level instead would make the rule improper: it shrinks
+        # penalties on big moves and quietly favors overly narrow forecasts.
+        scale = np.sqrt(var).mean(axis=1, keepdims=True)
+        rel_loss = loss / np.maximum(scale, 1e-12)
+        variants = {
+            ENSEMBLE_MODEL: None,
+            "ensemble_bma": loglik,
+            "ensemble_loss": -ENSEMBLE_LOSS_ETA * rel_loss,
+        }
+        for name, scores in variants.items():
+            weights = None
+            if scores is not None:
+                weights, last = sequential_weights(origins, int(h), scores, ENSEMBLE_FORGETTING)
+                latest.append(
+                    {
+                        "variant": name,
+                        "source": source,
+                        "horizon": int(h),
+                        "updates": int(len(base)),
+                        "weights": dict(zip(ENSEMBLE_MEMBERS, map(float, last), strict=True)),
+                    }
+                )
+            q_ens, var_ens = combine_quantiles(q, var, weights)
+            ens = base.copy()
+            ens["model"] = name
+            ens["var_bps2"] = var_ens
+            ens["q"] = list(q_ens)
+            frames.append(ens)
+
+    out = pd.concat([df, *[f.reindex(columns=df.columns) for f in frames]], ignore_index=True)
+    return out, latest
+
+
+def add_ensemble(df: pd.DataFrame) -> pd.DataFrame:
+    """``df`` plus the ensemble rows (see ``ensemble_frames``)."""
+    return ensemble_frames(df)[0]
 
 
 def summarize(df: pd.DataFrame) -> dict:
     """Summary rows, calibration, DM tests and a fit-window recommendation."""
     if df.empty:
-        return {"rows": [], "calibration": [], "recommended_fit_window": None}
+        return {"rows": [], "calibration": [], "recommended_fit_window": None,
+                "ensemble_weights": []}
 
-    df = add_ensemble(df).sort_values("origin_time")
+    df, ensemble_weights = ensemble_frames(df)
+    df = df.sort_values("origin_time")
     # Common strike range per (origin, horizon): the reference model's p1..p99 where it
     # exists, otherwise the row's own. Every model is then scored on the same strikes.
     ref = df.loc[df["model"] == REFERENCE_MODEL]
@@ -371,6 +488,7 @@ def summarize(df: pd.DataFrame) -> dict:
             "rows": rows,
             "calibration": calibration,
             "recommended_fit_window": recommend_fit_window(rows),
+            "ensemble_weights": ensemble_weights,
         }
     )
 

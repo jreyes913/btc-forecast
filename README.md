@@ -64,6 +64,17 @@ the sample **grows over time**.
     quantiles at each probability level, which keeps the bands sharp. It's built from the
     logged member forecasts at scoring time, so it gets scored on all history, including
     forecasts logged before it existed.
+  - `ensemble_bma` / `ensemble_loss`: the same quantile averaging, but with **adaptive
+    weights**.
+    - **How the weights update:** when each forecast resolves, every member's weight is
+      updated by how well it predicted the outcome. The Bayesian version uses its predictive
+      density there (dynamic Bayesian model averaging). The loss-based version uses its
+      pinball loss, scaled by the forecast SD known in advance so the rule stays proper.
+    - **Forgetting factor** (`ENSEMBLE_FORGETTING`, default 0.99): older evidence fades, so
+      weights can shift between market regimes instead of locking onto one model.
+    - **No look-ahead:** an outcome only affects forecasts made after it resolved.
+    - **Caveat:** learned weights often fail to beat equal weights when members are close
+      (the "forecast combination puzzle"), so these are challengers. Scoring decides.
 - **Metrics:**
   - Band coverage.
   - QLIKE (lower is better).

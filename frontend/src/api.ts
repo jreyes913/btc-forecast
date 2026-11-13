@@ -89,6 +89,15 @@ export interface BacktestResponse {
   rows: BacktestRow[];
   calibration: Calibration[];
   recommended_fit_window: string | null;
+  ensemble_weights: EnsembleWeights[];
+}
+
+export interface EnsembleWeights {
+  variant: "ensemble_bma" | "ensemble_loss";
+  source: "live" | "replay";
+  horizon: number;
+  updates: number;
+  weights: Record<"factor" | "gjr" | "ewma", number>;
 }
 
 export interface LiveBar {
