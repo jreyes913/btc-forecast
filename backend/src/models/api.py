@@ -26,6 +26,7 @@ class VolatilityPoint(BaseModel):
     time: datetime
     total_bps: float
     idiosyncratic_bps: float
+    typical_bps: float
 
 
 class Metrics(BaseModel):
@@ -43,8 +44,11 @@ class Metrics(BaseModel):
 class Diagnostics(BaseModel):
     n_obs: int
     last_bar_time: datetime
+    last_close: float
     resid_converged: bool
     factor_converged: bool
+    seasonality_active: bool
+    fit_window_hours: float
 
 
 class ForecastResponse(BaseModel):
@@ -52,3 +56,19 @@ class ForecastResponse(BaseModel):
     diagnostics: Diagnostics
     historical_volatility: list[VolatilityPoint]
     forecast: list[ForecastPoint]
+
+
+class LiveBar(BaseModel):
+    time: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
+
+class LiveResponse(BaseModel):
+    bar: LiveBar | None
+    last_closed_time: datetime | None
+    cone_origin_time: datetime | None
+    cone_origin_price: float | None
