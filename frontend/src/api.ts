@@ -128,3 +128,29 @@ export async function getJson<T>(url: string, signal: AbortSignal): Promise<T> {
   if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
   return res.json() as Promise<T>;
 }
+
+export interface LadderRow {
+  strike: number;
+  p_above: number;
+  p_below: number;
+  beyond_grid: "low" | "high" | null;
+  max_yes_cents: number | null;
+  max_no_cents: number | null;
+  bands: string[];
+  is_current: boolean;
+}
+
+export interface LadderResponse {
+  available: boolean;
+  deadline: string;
+  which: "next" | "following";
+  minutes_left: number;
+  reference_price: number;
+  reference_is_live: boolean;
+  cone_origin_time: string;
+  cone_model: string;
+  edge_points: number;
+  horizon_minutes: number | null;
+  ranges: { p68: [number, number]; p95: [number, number]; median: number } | null;
+  rows: LadderRow[];
+}

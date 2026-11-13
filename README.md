@@ -3,9 +3,33 @@
 A full-stack dashboard that ingests 1-minute OHLCV candles from Coinbase Exchange for
 `BTC-USD` and a basket of crypto majors (`ETH-USD`, `SOL-USD`, `XRP-USD`, `LTC-USD`). It keeps
 30 days of history in DuckDB and fits a **PCA factor CAPM + range-informed GJR-GARCH-X** model
-with time-of-day adjustment. The result is a forecast cone for the next hour built by
-filtered historical simulation. Every forecast is scored once its deadline passes. Everything
-is shown in a React + TradingView Lightweight Charts UI served by a single FastAPI process.
+with time-of-day adjustment. The result is a forecast cone for the next two hours, built by
+filtered historical simulation and averaged with two simpler models. Every forecast is scored
+once its deadline passes. Everything is shown in a React + TradingView Lightweight Charts UI
+served by a single FastAPI process.
+
+## Using the dashboard
+
+The page is laid out for trading Kalshi's hourly BTC price markets.
+
+1. **Strike probabilities** (top left). For the next top-of-hour deadline (or the hour after),
+   each $100 strike shows:
+   - the chance BTC finishes **at or above** it, and the chance it finishes below
+   - **Buy Yes at ≤** / **Buy No at ≤**: the most a contract is worth to you. That's the
+     model's chance minus a 10-point safety margin (`LADDER_EDGE_POINTS`). Only buy if
+     Kalshi's ask is at or below it, after fees.
+   - shaded rows for the cone's band lines (95% low → 68% low → median → 68% high → 95% high).
+     The table always reaches past both 95% edges into the tails.
+
+   The table is anchored on the **live** price and uses the minutes remaining until the
+   deadline, so a move since the cone's origin is already priced in.
+2. **What the model is saying.** Plain-English cards: volatility vs normal for the time of
+   day, how much of the risk is the whole crypto market, no directional call, and model health.
+3. **Charts.** Candles with the cone and the live bar, and volatility vs its typical level.
+4. **How reliable are these probabilities?** How often the 68% and 95% ranges actually
+   contained the final price, and whether "84%" strikes really finished above ~84% of the
+   time. This uses past forecasts from the model that draws the cone.
+5. **Model details** (collapsed). The raw factor and GARCH-X parameters.
 
 ---
 
@@ -84,10 +108,12 @@ the sample **grows over time**.
     horizons.
 - **Fit window:** the dashboard names the fit window with the lowest 30-minute QLIKE.
   Change `FIT_WINDOW` in `settings.py` to adopt it.
-- **Cone model:** the dashboard cone comes from the factor model by default. If the ensemble
-  scores better (lower QLIKE and Brier, DM p < 0.05), set `CONE_MODEL = "ensemble"` in
-  `settings.py`. Scoring always logs the members separately, so the comparison stays fair
-  whichever model draws the cone.
+- **Cone model:** the cone and strike table come from the equal-weight `ensemble`
+  (`CONE_MODEL` in `settings.py`). On real data it scored best or tied-best at 15–60 minutes.
+  Set `CONE_MODEL = "factor"` to switch back. Scoring always logs every model separately.
+- **Full comparison:** the dashboard only shows the cone model's reliability. For every
+  model side by side, run `python -m scripts.backtest` (stop the app first), or query
+  `GET /backtest`.
 
 ---
 
@@ -101,8 +127,9 @@ the sample **grows over time**.
 | Model | `backend/src/services/quant.py` | The pipeline above. |
 | Cache | `backend/src/services/forecast_cache.py` | One fit per new closed bar per horizon. The profile is refreshed hourly. |
 | Scoring | `backend/src/services/{scoring,evaluation,baselines}.py` | Forecast log, resolver, metrics, replay. |
-| API | `backend/app.py` | `GET /candles?product=&since=`, `GET /forecast?horizon=`, `GET /live`, `GET /backtest?source=all\|live\|replay`. Also serves `frontend/dist` at `/`. |
-| UI | `frontend/src/` | Candles with the cone and the live bar, plus a badge when price has moved since the cone's origin. Volatility vs its typical level for the time of day. Diagnostics, and the scoring table with a calibration chart. |
+| API | `backend/app.py` | `GET /candles?product=&since=`, `GET /forecast?horizon=`, `GET /live`, `GET /ladder?which=next\|following`, `GET /backtest?source=all\|live\|replay`. Also serves `frontend/dist` at `/`. |
+| Strike table | `backend/src/services/ladder.py` | Turns the cone into P(BTC ≥ K) for each $100 strike at the next hourly deadline, anchored on the live price. |
+| UI | `frontend/src/` | The strike table, plain-English insight cards, charts, a reliability summary, and collapsed model details. See "Using the dashboard". |
 
 ---
 

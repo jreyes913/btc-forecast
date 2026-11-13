@@ -1,7 +1,6 @@
 import type { CSSProperties, ReactNode } from "react";
-import type { BacktestResponse, BacktestSource, Diagnostics, Metrics } from "../api";
-import { cardStyle, colors, headingStyle, panelStyle } from "../theme";
-import { BacktestPanel } from "./BacktestPanel";
+import type { Diagnostics, Metrics } from "../api";
+import { cardStyle, colors, panelStyle } from "../theme";
 
 const grid: CSSProperties = {
   display: "grid",
@@ -49,14 +48,16 @@ function Params({ title, params }: { title: string; params: Record<string, numbe
 interface Props {
   metrics: Metrics | null;
   diagnostics: Diagnostics | null;
-  backtests: Partial<Record<BacktestSource, BacktestResponse>>;
-  backtestStatus: string;
 }
 
-export function MetricsPanel({ metrics, diagnostics, backtests, backtestStatus }: Props) {
+/** Raw model numbers, collapsed by default: the plain-English cards cover day-to-day use. */
+export function MetricsPanel({ metrics, diagnostics }: Props) {
   return (
-    <section style={{ ...panelStyle, display: "flex", flexDirection: "column", gap: "0.65rem" }}>
-      <h2 style={headingStyle}>Factor CAPM &amp; GARCH-X diagnostics</h2>
+    <details style={{ ...panelStyle }}>
+      <summary style={{ color: colors.textBody, cursor: "pointer", fontSize: "0.9rem" }}>
+        Model details (for the curious): factor CAPM and GARCH-X parameters
+      </summary>
+      <div style={{ display: "flex", flexDirection: "column", gap: "0.65rem", marginTop: "0.65rem" }}>
 
       {!metrics || !diagnostics ? (
         <div style={{ color: colors.textMuted, fontSize: "0.9rem" }}>Waiting for model fit…</div>
@@ -108,8 +109,7 @@ export function MetricsPanel({ metrics, diagnostics, backtests, backtestStatus }
           </div>
         </>
       )}
-
-      <BacktestPanel backtests={backtests} status={backtestStatus} />
-    </section>
+      </div>
+    </details>
   );
 }
