@@ -145,6 +145,9 @@ class ForecastResult:
     cum_return_var: np.ndarray  # forecast variance of the cumulative return (bps^2) per step
     cum_q_grid: np.ndarray  # (horizon, len(Q_GRID)) cumulative return quantiles, bps
     cone_model: str = "factor"  # which forecaster produced the bands
+    # Optional extra quantiles of the same simulated paths, (horizon, len(extra_levels)),
+    # e.g. a fine grid for CRPS in research backtests. None unless requested.
+    cum_q_extra: np.ndarray | None = None
 
 
 def _split_panel(
@@ -167,6 +170,7 @@ def fit_and_forecast(
     fit_window: dt.timedelta | None = None,
     n_sims: int = N_SIMULATIONS,
     seed: int | None = None,
+    extra_levels: np.ndarray | None = None,
 ) -> ForecastResult:
     """Fit on ``panel`` and forecast ``horizon`` minutes ahead.
 
@@ -263,6 +267,9 @@ def fit_and_forecast(
         price_mean=last_close * np.exp(cum / BPS).mean(axis=0),
         cum_return_var=cum.var(axis=0),
         cum_q_grid=np.quantile(cum, Q_GRID, axis=0).T,
+        cum_q_extra=(
+            None if extra_levels is None else np.quantile(cum, extra_levels, axis=0).T
+        ),
     )
 
 

@@ -27,3 +27,6 @@ frontend/dist/
 .vscode/
 .idea/
 .DS_Store
+
+# Research data (downloaded candles)
+backend/research/data/

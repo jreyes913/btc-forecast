@@ -1,7 +1,8 @@
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-extend-exclude = [".venv"]
+# research/garch_fhs.py is a frozen, externally supplied script: never reformat or "fix" it.
+extend-exclude = [".venv", "research/garch_fhs.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
