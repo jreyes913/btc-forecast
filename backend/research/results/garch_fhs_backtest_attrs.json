@@ -1,0 +1,42 @@
+{
+  "fit_failures": 0,
+  "total_origins": 1081,
+  "horizon_buckets": {
+    "h1": [
+      1,
+      1
+    ],
+    "h15": [
+      15,
+      15
+    ],
+    "h30": [
+      30,
+      30
+    ],
+    "h60": [
+      60,
+      60
+    ]
+  },
+  "confidence": 0.99,
+  "persistence_median": 0.9989994095995003,
+  "persistence_share_at_bound": 1.0,
+  "data": {
+    "source": "Coinbase Exchange public API, BTC-USD 1-minute candles",
+    "timestamp_convention": "candle open time + 1 min = close time (value at t known at t)",
+    "requested_range": [
+      "2026-07-25 00:01:00+00:00",
+      "2026-09-15 01:00:00+00:00"
+    ],
+    "kept_range": [
+      "2026-07-25 00:01:00+00:00",
+      "2026-09-15 01:00:00+00:00"
+    ],
+    "minutes_kept": 74940,
+    "candles_in_range": 74940,
+    "missing_minutes_before_fill": 0,
+    "warnings": []
+  },
+  "runtime_seconds": 393.4
+}
